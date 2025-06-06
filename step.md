@@ -32,13 +32,67 @@ Tracer les incidents où un mauvais matching impacte les montants d’engagement
 Suivre ces incidents dans le temps, avec un statut, une date, et des actions associées.
 Cette section permettra, dès que les données seront disponibles, de :
 
-Relier le matching aux impacts financiers (engagements, RWA).
-Prioriser les corrections en fonction des montants en jeu.
-Travail en cours et prochaines étapes
-Préparer les jeux de données structurées.
-Finaliser les règles de calcul des indicateurs.
-Transmettre les données aux équipes de Lisbonne pour intégration.
-Co-construire le dashboard et le valider avec les utilisateurs.
-Prévoir l’intégration future des incidents liés aux engagements et RWA.
-Lien vers la documentation technique
-Consulter la documentation technique du projet
+
+Performance
+Moteur de traitement basé sur Polars (Rust), utilisé pour l’ensemble des traitements de matching en mémoire.
+
+Exécution stable sur des volumétries de plusieurs millions de lignes (ex : données Bloomberg), sans problème de performance constaté à ce jour.
+
+Consommation mémoire maîtrisée :
+
+Jamais au-delà de 7 Go de RAM consommée en exécution (70 Go actuellement alloués sur le cluster, possibilité d’allocation jusqu’à 128 Go si besoin).
+
+Benchmarks internes : nette amélioration des temps de traitement par rapport aux solutions précédentes (Pandas, Spark).
+
+Maîtrise technique
+Solution intégralement maîtrisée en interne (architecture, code, logique de matching).
+
+Capacité d’évolution rapide (ajout de règles, adaptation aux nouveaux besoins métier).
+
+Qualité fonctionnelle
+Résultats de matching validés par les utilisateurs finaux sur les campagnes en production.
+
+Qualité conforme aux besoins métier actuels.
+
+Évolutivité / agilité
+Intégration de nouveaux providers opérationnelle en quelques jours.
+
+Architecture supportant une montée en charge (PODs, scale-out si besoin).
+
+Points d’amélioration identifiés
+Le fuzzy matching est aujourd’hui réalisé via l’API MatchMyData (héritage de la solution initiale Dataiku).
+
+Une évolution vers un fuzzy matching directement intégré dans le moteur est en cours, ce qui permettra d’améliorer encore la performance et l’autonomie de la solution.
+
+
+
+
+----------------
+
+Points d’amélioration identifiés
+Historique et positionnement du fuzzy matching :
+
+Initialement, l’ensemble du matching (core + fuzzy) était réalisé sur Dataiku :
+
+le core via des jointures/règles dans l'outil no-code,
+
+le fuzzy via l’interface manuelle de MatchMyData.
+
+Lors de la migration vers Polars, le core du matching a été repris en interne (performant et maîtrisé), et l’interface MatchMyData a été remplacée par un appel automatisé à leur API, pour conserver la logique fuzzy existante.
+
+Limitation actuelle :
+
+L’usage de l’API MatchMyData nécessite de transmettre un fichier de grande taille (> 2 millions de lignes), ce qui est devenu une contrainte lourde en production (limitations techniques, complexité opérationnelle, lenteur du traitement).
+
+Cette dépendance freine la scalabilité et l’automatisation complète du process.
+
+Évolution prévue :
+
+L’objectif est de supprimer l’usage de l’API MatchMyData et d’intégrer un moteur de fuzzy matching directement dans la chaîne de traitement interne (Polars + librairies adaptées), pour :
+
+lever la contrainte liée à l’envoi de fichiers massifs,
+
+améliorer la performance et la fluidité du process,
+
+disposer d’une solution entièrement maîtrisée et scalable.
+
