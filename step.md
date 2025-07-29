@@ -1,44 +1,35 @@
-Objectif du projet
-Mettre en place un dashboard pour piloter le matching entre RMPM et les providers de données (Bloomberg, MSCI, CDP, Sustainalytics, Orbis).
-Ce dashboard permettra de suivre les taux de matching, identifier les zones critiques, et faciliter la prise de décision.
+ Arbitrage sur le point d’exposition de l’API TVA intra-communautaire
 
-Le projet est réalisé en collaboration avec les équipes de Lisbonne :
+Bonjour 
 
-Notre rôle : structurer et préparer les données.
-Lisbonne : intégration et développement du dashboard Power BI.
-Livrable attendu
-Dashboard interactif avec filtres sur :
+Avec Manel, nous avions prévu d’échanger avec toi avant son départ sur l’exposition des données de TVA intra-communautaire, que nous devons rendre accessibles à d’autres entités du groupe BNP. Je te partage donc les éléments pour arbitrage.
 
-Date
-Provider
-Entité
-Indicateurs clés :
+Les données sont traitées par notre équipe UMD.
+Nous souhaitons exposer une API pour permettre leur consommation, mais un arbitrage est nécessaire quant au point d’exposition : faut-il le faire directement depuis UMD, via APIGEE, ou attendre une exposition centralisée par TPN ?
 
-Nombre et pourcentage de records appariés
-Nombre et pourcentage de records non appariés
-Suivi de l’évolution des taux de matching et identification des actions à mettre en place.
+À date, TPN a indiqué qu’ils resteront sur un mode tactique jusqu’en 2026, sans visibilité claire sur le démarrage de leur roadmap sur ce sujet. Cela nous pousse à envisager des alternatives pour ne pas bloquer la mise à disposition.
 
-Enjeux
-Piloter la qualité du matching entre RMPM et les providers.
-Identifier rapidement les écarts ou les faiblesses de couverture.
-Faciliter les échanges avec les providers pour améliorer la donnée.
-Section Incidents : Montants d’engagement et RWA
-Le dashboard a également vocation à intégrer une section de suivi des incidents liés aux montants d’engagement et RWA.
+Voici les trois scénarios envisagés :
 
-Aujourd’hui, ces données ne sont pas accessibles pour être intégrées directement au dashboard.
-Cependant, l’objectif est de :
+1. Exposition via UMD + APIGEE
 
-Tracer les incidents où un mauvais matching impacte les montants d’engagement ou les RWA.
-Suivre ces incidents dans le temps, avec un statut, une date, et des actions associées.
-Cette section permettra, dès que les données seront disponibles, de :
+Avantages : permet d’exposer rapidement l’API sans attendre TPN ; pas de déportation à prévoir pour les consommateurs lors de la migration vers TPN
 
-Relier le matching aux impacts financiers (engagements, RWA).
-Prioriser les corrections en fonction des montants en jeu.
-Travail en cours et prochaines étapes
-Préparer les jeux de données structurées.
-Finaliser les règles de calcul des indicateurs.
-Transmettre les données aux équipes de Lisbonne pour intégration.
-Co-construire le dashboard et le valider avec les utilisateurs.
-Prévoir l’intégration future des incidents liés aux engagements et RWA.
-Lien vers la documentation technique
-Consulter la documentation technique du projet
+Inconvénients : nécessite un passage par APIGEE (développement supplémentaire), donc mise en œuvre un peu plus longue que la cible UMD directe
+
+2. Exposition via TPN (solution cible)
+
+Avantages : conforme à l’architecture cible 4ALL
+
+Inconvénients : les développements n’ont pas commencé, la charge est importante, et nous n’avons aucune visibilité sur un atterrissage court terme
+
+3. Exposition directe via UMD (sans APIGEE)
+
+Avantages : très rapide à mettre en place
+
+Inconvénients : les clients devront se reconnecter une fois la migration vers TPN effectuée
+
+Nous avons besoin de ton arbitrage pour pouvoir avancer sereinement sur ce sujet.
+
+Bonne journée,
+Fatima
