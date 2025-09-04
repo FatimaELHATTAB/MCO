@@ -1,45 +1,133 @@
-from src.core.rules_loader import load_provider_config
+from __future__ import annotations
+from pathlib import Path
+import yaml
+from typing import Dict, List
 
-def test_inheritance(tmp_path, monkeypatch):
-    # Simuler un config/providers avec un base.yaml et un sustain.yaml
-    cfg_dir = tmp_path / "config" / "providers"
-    cfg_dir.mkdir(parents=True)
+CONFIG_DIR = Path(__file__).resolve().parents[2] / "config" / "providers"
 
-    base_yaml = """
-matching:
-  levels:
-    - name: level1_exact
-      type: exact
-      left_keys: ["LEI"]
-      right_keys: ["LEI"]
-tie_break:
-  priority: ["level1_exact"]
-  prefer: ["LEI"]
-"""
-    (cfg_dir / "base.yaml").write_text(base_yaml)
 
-    sustain_yaml = """
-_inherit: base.yaml
-provider: SUSTAIN
-source:
-  table: normalized.sustain
-matching:
-  levels:
-    - name: level2_isin
-      type: exact
-      left_keys: ["ISIN"]
-      right_keys: ["ISIN"]
-"""
-    (cfg_dir / "sustain.yaml").write_text(sustain_yaml)
+class LevelRule:
+    def __init__(self, name: str, matching_rule: str, rmpm: List[str], provider: List[str], type_: str = "exact"):
+        self.name = name
+        self.matching_rule = matching_rule
+        self.rmpm = rmpm
+        self.provider = provider
+        self.type = type_
 
-    # Monkeypatch CONFIG_DIR
-    monkeypatch.setattr("src.core.rules_loader.CONFIG_DIR", cfg_dir)
+    def __repr__(self) -> str:
+        return f"<LevelRule {self.name}: {self.matching_rule}>"
+
+
+class ProviderConfig:
+    def __init__(self, provider: str, source: Dict, persist: Dict, levels: List[LevelRule]):
+        self.provider = provider
+        self.source = source
+        self.persist = persist
+        self.levels = levels
+
+
+def _deep_merge(base: dict, override: dict) -> dict:
+    out = dict(base)
+    for k, v in override.items():
+        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
+            out[k] = _deep_merge(out[k], v)
+        else:
+            out[k] = v
+    return out
+
+
+def _sort_levels(levels: Dict[str, dict]) -> List[str]:
+    def keyfn(k: str):
+        num = "".join(ch for ch in k if ch.isdigit()) or "0"
+        suffix = "".join(ch for ch in k if not ch.isdigit())
+        return (int(num), suffix)
+    return sorted(levels.keys(), key=keyfn)
+
+
+def load_provider_config(provider: str) -> ProviderConfig:
+    cfg_path = CONFIG_DIR / f"{provider}.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config introuvable: {cfg_path}")
+
+    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
+    if "_inherit" in cfg:
+        base_file = CONFIG_DIR / cfg["_inherit"]
+        base_cfg = yaml.safe_load(base_file.read_text(encoding="utf-8")) or {}
+        cfg = _deep_merge(base_cfg, cfg)
+        cfg.pop("_inherit", None)
+
+    provider_name = cfg.get("provider", provider)
+    levels_cfg = cfg.get("matching_criterias", {})
+    order = _sort_levels(levels_cfg)
+
+    levels = [
+        LevelRule(name=k,
+                  matching_rule=levels_cfg[k]["matching_rule"],
+                  rmpm=levels_cfg[k]["rmpm"],
+                  provider=levels_cfg[k]["provider"],
+                  type_=levels_cfg[k].get("type", "exact"))
+        for k in order
+    ]
+
+    return ProviderConfig(
+        provider=provider_name,
+        source=cfg.get("source", {}),
+        persist=cfg.get("persist", {}),
+        levels=levels
+    )
+
+
+import tempfile
+from pathlib import Path
+import yaml
+
+from src.core.rules_loader import load_provider_config, CONFIG_DIR
+
+def test_load_provider_config_with_inherit(monkeypatch, tmp_path):
+    # créer un faux config/providers
+    providers_dir = tmp_path / "providers"
+    providers_dir.mkdir()
+
+    # base.yaml avec 1 règle
+    base_yaml = {
+        "matching_criterias": {
+            "level1": {
+                "matching_rule": "3WM : Legal Name, Immat Country, LEI",
+                "rmpm": ["LB_RAISN_SCIAL_untouched", "CD_PAYS_IMMAT_left", "LEI_final"],
+                "provider": ["TGT_COMPANY_NAME_untouched", "TGT_COUNTRY", "LEI"]
+            }
+        }
+    }
+    (providers_dir / "base.yaml").write_text(yaml.dump(base_yaml))
+
+    # sustain.yaml qui hérite
+    sustain_yaml = {
+        "_inherit": "base.yaml",
+        "provider": "SUSTAIN",
+        "source": {"table": "normalized.sustain"},
+        "matching_criterias": {
+            "level2": {
+                "matching_rule": "1WM : ISIN",
+                "rmpm": ["ISIN_final"],
+                "provider": ["ISIN"]
+            }
+        }
+    }
+    (providers_dir / "sustain.yaml").write_text(yaml.dump(sustain_yaml))
+
+    # monkeypatch le répertoire CONFIG_DIR
+    monkeypatch.setattr("src.core.rules_loader.CONFIG_DIR", providers_dir)
 
     cfg = load_provider_config("sustain")
 
-    # Le résultat doit contenir à la fois level1_exact (hérité) et level2_isin (spécifique)
-    levels = [lvl["name"] for lvl in cfg["matching"]["levels"]]
-    assert "level1_exact" in levels
-    assert "level2_isin" in levels
-    assert cfg["provider"] == "SUSTAIN"
-    assert cfg["source"]["table"] == "normalized.sustain"
+    assert cfg.provider == "SUSTAIN"
+    assert cfg.source["table"] == "normalized.sustain"
+
+    # Vérifie qu'on a bien level1 (hérité) + level2 (spécifique)
+    names = [lvl.name for lvl in cfg.levels]
+    assert "level1" in names
+    assert "level2" in names
+    # Vérifie le mapping des colonnes
+    lvl1 = next(l for l in cfg.levels if l.name == "level1")
+    assert "LB_RAISN_SCIAL_untouched" in lvl1.rmpm
+    assert "TGT_COMPANY_NAME_untouched" in lvl1.provider
