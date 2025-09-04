@@ -1,30 +1,55 @@
-#!/bin/bash
-# create_project_structure.sh
-# Script pour créer l'arborescence du moteur de matching
+matching_criterias:
+  level1:
+    matching_rule: "3WM : Legal Name, Immat Country, LEI"
+    rmpm: [ "LB_RAISN_SCIAL_untouched", "CD_PAYS_IMMAT_left", "LEI_final" ]
+    provider: [ "TGT_COMPANY_NAME_untouched", "TGT_COUNTRY", "LEI" ]
 
-BASE_DIR="matching_engine"
+  level1bis:
+    matching_rule: "2WM : Immat Country, LEI"
+    rmpm: [ "CD_PAYS_IMMAT_left", "LEI_final" ]
+    provider: [ "TGT_COUNTRY", "LEI" ]
 
-mkdir -p $BASE_DIR/{config/{envs,providers},src/{core,utils,cli},tests/{unit,integration,regression/data},docker}
+  level2:
+    matching_rule: "3WM : Legal Name, Immat Country, ISIN"
+    rmpm: [ "LB_RAISN_SCIAL_left_original", "CD_PAYS_IMMAT_left", "ISIN_final" ]
+    provider: [ "TGT_COMPANY_NAME_original", "TGT_COUNTRY", "ISIN" ]
 
-# Fichiers de config
-touch $BASE_DIR/config/envs/dev.yaml
-touch $BASE_DIR/config/envs/prod.yaml
-touch $BASE_DIR/config/providers/base.yaml
-touch $BASE_DIR/config/providers/sustain.yaml
+  level2bis:
+    matching_rule: "2WM : Immat Country, ISIN"
+    rmpm: [ "CD_PAYS_IMMAT_left", "ISIN_final" ]
+    provider: [ "TGT_COUNTRY", "ISIN" ]
 
-# Code source
-touch $BASE_DIR/src/core/{pipeline.py,exact_matcher.py,fuzzy_matcher.py,tie_breaker.py,rules_loader.py,db_io.py}
-touch $BASE_DIR/src/utils/{logger.py,timer.py,normalizer.py,vault_client.py}
-touch $BASE_DIR/src/cli/entrypoint.py
-touch $BASE_DIR/src/__init__.py
+  level3:
+    matching_rule: "2WM : Legal Name, Immat Country"
+    rmpm: [ "LB_RAISN_SCIAL_left_original", "CD_PAYS_IMMAT_left" ]
+    provider: [ "TGT_COMPANY_NAME_original", "TGT_COUNTRY" ]
 
-# Tests
-touch $BASE_DIR/tests/unit/{test_exact_matcher.py,test_fuzzy_matcher.py,test_tie_breaker.py,test_rules_loader.py,test_db_io.py,test_normalizer.py}
-touch $BASE_DIR/tests/integration/test_pipeline_end_to_end.py
-touch $BASE_DIR/tests/regression/test_regression.py
-touch $BASE_DIR/tests/regression/data/{rmpm_sample.csv,sustain_sample.csv,expected_matches.csv}
+  level4:
+    matching_rule: "2WM : Legal Name Cleaned, Immat Country"
+    rmpm: [ "LB_RAISN_SCIAL_left_cleaned", "CD_PAYS_IMMAT_left" ]
+    provider: [ "TGT_COMPANY_NAME_cleaned", "TGT_COUNTRY" ]
 
-# Racine
-touch $BASE_DIR/{matching_prod_algorithm.py,Dockerfile,pyproject.toml,Makefile}
+  level5:
+    matching_rule: "1WM : LEI"
+    rmpm: [ "LEI_final" ]
+    provider: [ "LEI" ]
 
-echo "✅ Arborescence créée sous $BASE_DIR"
+  level6:
+    matching_rule: "1WM : ISIN"
+    rmpm: [ "ISIN_final" ]
+    provider: [ "ISIN" ]
+
+  level7:
+    matching_rule: "2WM : Legal Name, Business Country"
+    rmpm: [ "LB_RAISN_SCIAL_left_original", "CD_PAYS_BUSINESS_left" ]
+    provider: [ "TGT_COMPANY_NAME_original", "TGT_COUNTRY" ]
+
+  level8:
+    matching_rule: "2WM : Legal Name Cleaned, Business Country"
+    rmpm: [ "LB_RAISN_SCIAL_left_cleaned", "CD_PAYS_BUSINESS_left" ]
+    provider: [ "TGT_COMPANY_NAME_cleaned", "TGT_COUNTRY" ]
+
+  level9:
+    matching_rule: "1WM : Legal Name"
+    rmpm: [ "LB_RAISN_SCIAL_left_original" ]
+    provider: [ "TGT_COMPANY_NAME_original" ]
