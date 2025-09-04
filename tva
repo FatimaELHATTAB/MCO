@@ -1,133 +1,393 @@
 from __future__ import annotations
-from pathlib import Path
-import yaml
-from typing import Dict, List
+import os
+import sys
+from typing import Optional
 
-CONFIG_DIR = Path(__file__).resolve().parents[2] / "config" / "providers"
-
-
-class LevelRule:
-    def __init__(self, name: str, matching_rule: str, rmpm: List[str], provider: List[str], type_: str = "exact"):
-        self.name = name
-        self.matching_rule = matching_rule
-        self.rmpm = rmpm
-        self.provider = provider
-        self.type = type_
-
-    def __repr__(self) -> str:
-        return f"<LevelRule {self.name}: {self.matching_rule}>"
+try:
+    import hvac  # peut être absent en local
+except Exception:  # pragma: no cover (géré par tests via monkeypatch sys.modules)
+    hvac = None  # type: ignore
 
 
-class ProviderConfig:
-    def __init__(self, provider: str, source: Dict, persist: Dict, levels: List[LevelRule]):
-        self.provider = provider
-        self.source = source
-        self.persist = persist
-        self.levels = levels
+class SecretManager:
+    """
+    Récupère un secret depuis Vault (KV v2) avec fallback sur une variable d'env.
+    Usage:
+        sm = SecretManager()
+        dsn = sm.get(path="postgres/dev", key="dsn", env_fallback="POSTGRES_DSN")
+    """
+
+    def __init__(self, *, addr: Optional[str] = None, token: Optional[str] = None):
+        self.addr = addr or os.environ.get("VAULT_ADDR")
+        self.token = token or os.environ.get("VAULT_TOKEN")
+        self._client = None
+        if hvac and self.addr and self.token:
+            try:
+                self._client = hvac.Client(url=self.addr, token=self.token)  # type: ignore[attr-defined]
+            except Exception:
+                # on reste silencieux → fallback env
+                self._client = None
+
+    def get(self, *, path: str, key: str, env_fallback: Optional[str] = None) -> Optional[str]:
+        # Tentative Vault
+        if self._client:
+            try:
+                # KV v2: client.secrets.kv.read_secret_version(path="...")
+                data = self._client.secrets.kv.read_secret_version(path=path)  # type: ignore[attr-defined]
+                val = (data.get("data", {}).get("data", {}) or {}).get(key)
+                if val is not None:
+                    return val
+            except Exception:
+                pass  # fallback env
+        # Fallback env
+        if env_fallback:
+            return os.environ.get(env_fallback)
+        return None
 
 
-def _deep_merge(base: dict, override: dict) -> dict:
-    out = dict(base)
-    for k, v in override.items():
-        if k in out and isinstance(out[k], dict) and isinstance(v, dict):
-            out[k] = _deep_merge(out[k], v)
+
+import sys
+import types
+import os
+
+from src.core.secret_manager import SecretManager
+
+
+def test_secret_manager_env_fallback(monkeypatch):
+    monkeypatch.delenv("VAULT_ADDR", raising=False)
+    monkeypatch.delenv("VAULT_TOKEN", raising=False)
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://env_user:env_pass@host:5432/db")
+
+    sm = SecretManager()
+    got = sm.get(path="postgres/dev", key="dsn", env_fallback="POSTGRES_DSN")
+    assert got == "postgresql://env_user:env_pass@host:5432/db"
+
+
+def test_secret_manager_vault_happy_path(monkeypatch):
+    """
+    On simule le module hvac et un client KV v2.
+    """
+    # Faux module hvac
+    fake_hvac = types.SimpleNamespace()
+
+    class FakeKV:
+        def read_secret_version(self, path: str):
+            assert path == "postgres/dev"
+            return {"data": {"data": {"dsn": "postgresql://vault_user:vault_pass@host:5432/db"}}}
+
+    class FakeSecrets:
+        def __init__(self):
+            self.kv = FakeKV()
+
+    class FakeClient:
+        def __init__(self, url: str, token: str):
+            assert url == "https://vault"
+            assert token == "t0k3n"
+            self.secrets = FakeSecrets()
+
+    fake_hvac.Client = FakeClient  # type: ignore[attr-defined]
+    monkeypatch.setitem(sys.modules, "hvac", fake_hvac)
+
+    monkeypatch.setenv("VAULT_ADDR", "https://vault")
+    monkeypatch.setenv("VAULT_TOKEN", "t0k3n")
+
+    sm = SecretManager()
+    got = sm.get(path="postgres/dev", key="dsn", env_fallback="POSTGRES_DSN")
+    assert got == "postgresql://vault_user:vault_pass@host:5432/db"
+
+
+
+from __future__ import annotations
+from typing import Iterator, Optional, List
+
+import polars as pl
+import psycopg
+
+from src.core.secret_manager import SecretManager
+
+
+class DBClient:
+    """
+    Client Postgres avec deux modes de lecture :
+      - read_table : simple et rapide (Polars lit tout)
+      - iter_table : streaming par chunks (curseur côté serveur)
+    + verify_table : stats rapides (échantillon) pour sanity checks.
+    """
+
+    def __init__(self, env: str = "dev", dsn: Optional[str] = None):
+        if dsn:
+            self.dsn = dsn
         else:
-            out[k] = v
-    return out
+            sm = SecretManager()
+            self.dsn = sm.get(path=f"postgres/{env}", key="dsn", env_fallback="POSTGRES_DSN")
+        if not self.dsn:
+            raise RuntimeError("DSN introuvable (Vault postgres/<env> dsn ou env POSTGRES_DSN).")
+
+    # --- Mode direct (rapide) ---
+    def read_table(self, table: str, where: Optional[str] = None, limit: Optional[int] = None) -> pl.DataFrame:
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        if limit:
+            sql += f" LIMIT {limit}"
+        # Polars sait lire directement via URI psycopg3
+        return pl.read_database(sql, connection_uri=self.dsn)  # type: ignore[arg-type]
+
+    # --- Mode chunk (mémoire optimale) ---
+    def iter_table(self, table: str, where: Optional[str] = None, chunk_size: int = 100_000) -> Iterator[pl.DataFrame]:
+        sql = f"SELECT * FROM {table}"
+        if where:
+            sql += f" WHERE {where}"
+        with psycopg.connect(self.dsn) as conn:
+            # curseur côté serveur pour streamer sans tout charger
+            with conn.cursor(name="stream") as cur:
+                cur.itersize = chunk_size
+                cur.execute(sql)
+                cols: List[str] = [c.name for c in cur.description]  # type: ignore[attr-defined]
+                while True:
+                    rows = cur.fetchmany(chunk_size)
+                    if not rows:
+                        break
+                    yield pl.DataFrame(rows, schema=cols)
+
+    # --- Vérifications rapides ---
+    def verify_table(self, table: str, where: Optional[str] = None, sample: int = 1000) -> dict:
+        df = self.read_table(table, where=where, limit=sample)
+        return {
+            "rows_sampled": df.height,
+            "columns": df.columns,
+            "null_counts": df.null_count().to_dict(as_series=False),
+            "dtypes": {c: str(df[c].dtype) for c in df.columns},
+        }
 
 
-def _sort_levels(levels: Dict[str, dict]) -> List[str]:
-    def keyfn(k: str):
-        num = "".join(ch for ch in k if ch.isdigit()) or "0"
-        suffix = "".join(ch for ch in k if not ch.isdigit())
-        return (int(num), suffix)
-    return sorted(levels.keys(), key=keyfn)
+import types
+import polars as pl
+import sys
+
+from src.core.db_client import DBClient
 
 
-def load_provider_config(provider: str) -> ProviderConfig:
-    cfg_path = CONFIG_DIR / f"{provider}.yaml"
-    if not cfg_path.exists():
-        raise FileNotFoundError(f"Config introuvable: {cfg_path}")
+def test_read_table_calls_polars_read_database(monkeypatch):
+    calls = {}
 
-    cfg = yaml.safe_load(cfg_path.read_text(encoding="utf-8")) or {}
-    if "_inherit" in cfg:
-        base_file = CONFIG_DIR / cfg["_inherit"]
-        base_cfg = yaml.safe_load(base_file.read_text(encoding="utf-8")) or {}
-        cfg = _deep_merge(base_cfg, cfg)
-        cfg.pop("_inherit", None)
+    def fake_read_database(sql: str, connection_uri: str):
+        # on capture les arguments pour vérifier le SQL
+        calls["sql"] = sql
+        calls["uri"] = connection_uri
+        return pl.DataFrame({"ID_INTRN": [1, 2], "LEI_final": ["A", "B"]})
 
-    provider_name = cfg.get("provider", provider)
-    levels_cfg = cfg.get("matching_criterias", {})
-    order = _sort_levels(levels_cfg)
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setattr(pl, "read_database", fake_read_database)
 
-    levels = [
-        LevelRule(name=k,
-                  matching_rule=levels_cfg[k]["matching_rule"],
-                  rmpm=levels_cfg[k]["rmpm"],
-                  provider=levels_cfg[k]["provider"],
-                  type_=levels_cfg[k].get("type", "exact"))
-        for k in order
-    ]
+    db = DBClient(env="dev")
+    df = db.read_table("normalized.rmpm", where="ingestion_ts >= now() - interval '7 days'", limit=10)
 
-    return ProviderConfig(
-        provider=provider_name,
-        source=cfg.get("source", {}),
-        persist=cfg.get("persist", {}),
-        levels=levels
+    assert df.shape == (2, 2)
+    assert "SELECT * FROM normalized.rmpm WHERE ingestion_ts >= now() - interval '7 days' LIMIT 10" in calls["sql"]
+    assert calls["uri"].startswith("postgresql://")
+
+
+def test_iter_table_yields_chunks(monkeypatch):
+    # On simule psycopg.connect et un curseur server-side
+    class FakeCursor:
+        def __init__(self):
+            self.description = [types.SimpleNamespace(name="ID_INTRN"), types.SimpleNamespace(name="TGT_ID")]
+            self._data = [
+                [(1, 10), (2, 20)],  # chunk 1 (liste de tuples)
+                [(3, 30)],           # chunk 2
+                []                   # fin
+            ]
+            self._i = 0
+            self.itersize = 0
+
+        def execute(self, sql: str):
+            assert sql == "SELECT * FROM normalized.sustain"
+
+        def fetchmany(self, n: int):
+            if self._i >= len(self._data):
+                return []
+            # transformer liste de tuples "internes" en liste de tuples standard
+            rows = [tuple(x) for x in self._data[self._i]]
+            self._i += 1
+            return rows
+
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc, tb): return False
+
+    class FakeConn:
+        def cursor(self, name=None): return FakeCursor()
+        def __enter__(self): return self
+        def __exit__(self, exc_type, exc, tb): return False
+
+    def fake_connect(dsn: str):  # noqa: ARG001
+        return FakeConn()
+
+    import psycopg
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setattr(psycopg, "connect", fake_connect)
+
+    db = DBClient(env="dev")
+    chunks = list(db.iter_table("normalized.sustain"))
+    assert len(chunks) == 2
+    assert chunks[0].shape == (2, 2)
+    assert chunks[1].shape == (1, 2)
+    assert chunks[0].columns == ["ID_INTRN", "TGT_ID"]
+
+
+def test_verify_table_returns_stats(monkeypatch):
+    # Monkeypatch read_table pour contrôler la sortie
+    sample = pl.DataFrame({
+        "ID_INTRN": [1, 2, None],
+        "LEI_final": ["X", None, "Z"],
+    })
+
+    def fake_read_table(self, table: str, where=None, limit=None):  # noqa: ARG002
+        return sample
+
+    monkeypatch.setenv("POSTGRES_DSN", "postgresql://user:pass@host:5432/db")
+    monkeypatch.setattr(DBClient, "read_table", fake_read_table)
+
+    db = DBClient(env="dev")
+    stats = db.verify_table("normalized.rmpm", sample=3)
+
+    assert stats["rows_sampled"] == 3
+    assert stats["columns"] == ["ID_INTRN", "LEI_final"]
+    # null_counts structure: {"ID_INTRN": [1], "LEI_final": [1]} (to_dict(as_series=False))
+    # on vérifie juste que chaque colonne a au moins une entrée
+    assert all(k in stats["null_counts"] for k in ["ID_INTRN", "LEI_final"])
+    assert all(k in stats["dtypes"] for k in ["ID_INTRN", "LEI_final"])
+
+
+
+
+from __future__ import annotations
+from typing import Sequence
+import polars as pl
+
+
+class ExactMatcher:
+    """
+    Applique une règle de matching exacte (multi-clés), sans aucun renommage destructif.
+    - Conserve les noms de colonnes DB tels quels.
+    - Si des colonnes existent des deux côtés, on garde la version RMPM (gauche) et on supprime UNIQUEMENT
+      la version suffixée du côté provider (ex: 'ID_INTRN_prov'), générée par le join.
+    - Ajoute: tmp_match_level, tmp_match_score=100.
+    """
+
+    def match(
+        self,
+        left: pl.DataFrame,
+        right: pl.DataFrame,
+        *,
+        level_name: str,
+        left_keys: Sequence[str],
+        right_keys: Sequence[str],
+    ) -> pl.DataFrame:
+        if not left_keys or not right_keys or len(left_keys) != len(right_keys):
+            raise ValueError("left_keys et right_keys doivent être non vides et de même longueur")
+
+        # join exact (inner), éviter collisions via suffix côté provider
+        joined = left.join(
+            right,
+            left_on=list(left_keys),
+            right_on=list(right_keys),
+            how="inner",
+            suffix="_prov",
+        )
+
+        # colonnes qui existent des deux côtés → supprimer uniquement la version suffixée
+        overlap = [c for c in right.columns if c in left.columns]
+        drop_cols = [f"{c}_prov" for c in overlap if f"{c}_prov" in joined.columns]
+
+        out = (
+            joined.drop(drop_cols)
+                  .with_columns([
+                      pl.lit(level_name).alias("tmp_match_level"),
+                      pl.lit(100).alias("tmp_match_score"),
+                  ])
+        )
+        return out
+
+
+import polars as pl
+from src.core.exact_matcher import ExactMatcher
+
+
+def test_exact_matcher_two_keys_no_overlap():
+    """
+    Cas réaliste niveau3:
+      rmpm: ['LB_RAISN_SCIAL_left_original','CD_PAYS_IMMAT_left']
+      provider: ['TGT_COMPANY_NAME_original','TGT_COUNTRY']
+    """
+    left = pl.DataFrame({
+        "ID_INTRN": [1, 2, 3],
+        "LB_RAISN_SCIAL_left_original": ["ACME SA", "BETA LTD", "OMEGA SPA"],
+        "CD_PAYS_IMMAT_left": ["FR", "GB", "IT"],
+        "LEI_final": ["L1", "L2", "L3"],
+        "ISIN_final": ["ISIN1", "ISIN2", "ISIN3"],
+    })
+    right = pl.DataFrame({
+        "TGT_ID": [10, 20, 30],
+        "TGT_COMPANY_NAME_original": ["ACME SA", "BETA LTD", "DELTA SPA"],  # OMEGA ≠ DELTA → 1 non-match
+        "TGT_COUNTRY": ["FR", "GB", "IT"],
+        "LEI": ["L1", "L2", "Lx"],
+        "ISIN": ["ISIN1", "ISIN2", "ISINx"],
+    })
+
+    m = ExactMatcher()
+    res = m.match(
+        left, right,
+        level_name="level3",
+        left_keys=["LB_RAISN_SCIAL_left_original", "CD_PAYS_IMMAT_left"],
+        right_keys=["TGT_COMPANY_NAME_original", "TGT_COUNTRY"],
     )
 
+    # ACME/FR & BETA/GB matchent → 2 lignes
+    assert res.height == 2
+    # Colonnes originales présentes, pas de renommages destructifs
+    for col in ["ID_INTRN", "LB_RAISN_SCIAL_left_original", "CD_PAYS_IMMAT_left", "TGT_ID", "TGT_COUNTRY"]:
+        assert col in res.columns
+    # Méta colonnes
+    assert set(["tmp_match_level", "tmp_match_score"]).issubset(res.columns)
+    assert res.select("tmp_match_level").unique().to_series().to_list() == ["level3"]
+    assert res.select("tmp_match_score").unique().to_series().to_list() == [100]
 
-import tempfile
-from pathlib import Path
-import yaml
 
-from src.core.rules_loader import load_provider_config, CONFIG_DIR
+def test_exact_matcher_overlap_dropped_suffix():
+    """
+    Vérifie qu'en cas de colonne commune (ex: ID_INTRN aussi côté provider),
+    la colonne suffixée '_prov' est supprimée et la colonne gauche est conservée.
+    """
+    left = pl.DataFrame({
+        "ID_INTRN": [1, 2],
+        "CD_PAYS_IMMAT_left": ["FR", "GB"],
+        "LEI_final": ["L1", "L2"],
+    })
+    right = pl.DataFrame({
+        "ID_INTRN": [999, 888],  # colonne commune (cheat pour tester la logique de drop)
+        "TGT_ID": [10, 20],
+        "TGT_COUNTRY": ["FR", "GB"],
+        "LEI": ["L1", "L2"],
+    })
 
-def test_load_provider_config_with_inherit(monkeypatch, tmp_path):
-    # créer un faux config/providers
-    providers_dir = tmp_path / "providers"
-    providers_dir.mkdir()
+    m = ExactMatcher()
+    res = m.match(
+        left, right,
+        level_name="levelX",
+        left_keys=["LEI_final", "CD_PAYS_IMMAT_left"],
+        right_keys=["LEI", "TGT_COUNTRY"],
+    )
 
-    # base.yaml avec 1 règle
-    base_yaml = {
-        "matching_criterias": {
-            "level1": {
-                "matching_rule": "3WM : Legal Name, Immat Country, LEI",
-                "rmpm": ["LB_RAISN_SCIAL_untouched", "CD_PAYS_IMMAT_left", "LEI_final"],
-                "provider": ["TGT_COMPANY_NAME_untouched", "TGT_COUNTRY", "LEI"]
-            }
-        }
-    }
-    (providers_dir / "base.yaml").write_text(yaml.dump(base_yaml))
+    # 2 matches
+    assert res.height == 2
 
-    # sustain.yaml qui hérite
-    sustain_yaml = {
-        "_inherit": "base.yaml",
-        "provider": "SUSTAIN",
-        "source": {"table": "normalized.sustain"},
-        "matching_criterias": {
-            "level2": {
-                "matching_rule": "1WM : ISIN",
-                "rmpm": ["ISIN_final"],
-                "provider": ["ISIN"]
-            }
-        }
-    }
-    (providers_dir / "sustain.yaml").write_text(yaml.dump(sustain_yaml))
+    # 'ID_INTRN' (gauche) est présent
+    assert "ID_INTRN" in res.columns
+    # 'ID_INTRN_prov' (suffixe issu du provider) doit être supprimé
+    assert "ID_INTRN_prov" not in res.columns
 
-    # monkeypatch le répertoire CONFIG_DIR
-    monkeypatch.setattr("src.core.rules_loader.CONFIG_DIR", providers_dir)
+    # colonnes provider uniques sont présentes
+    assert set(["TGT_ID", "TGT_COUNTRY"]).issubset(res.columns)
 
-    cfg = load_provider_config("sustain")
 
-    assert cfg.provider == "SUSTAIN"
-    assert cfg.source["table"] == "normalized.sustain"
-
-    # Vérifie qu'on a bien level1 (hérité) + level2 (spécifique)
-    names = [lvl.name for lvl in cfg.levels]
-    assert "level1" in names
-    assert "level2" in names
-    # Vérifie le mapping des colonnes
-    lvl1 = next(l for l in cfg.levels if l.name == "level1")
-    assert "LB_RAISN_SCIAL_untouched" in lvl1.rmpm
-    assert "TGT_COMPANY_NAME_untouched" in lvl1.provider
