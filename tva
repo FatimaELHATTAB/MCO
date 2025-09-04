@@ -1,9 +1,52 @@
-_inherit: base.yaml
+from __future__ import annotations
+from pathlib import Path
+import yaml
 
-provider: "SUSTAIN"
-source:
-  table: "normalized.sustain"
-  where: null
-persist:
-  table: "normalized.matches"
-  key: ["ID_INTRN", "TGT_ID", "provider"]
+CONFIG_DIR = Path(__file__).resolve().parents[2] / "config" / "providers"
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """
+    Merge récursif de deux dictionnaires :
+    - les valeurs de override écrasent celles de base
+    - si les deux ont un dict, on merge récursivement
+    - si les deux ont une liste, on concatène (optionnel, tu peux changer en override complet)
+    """
+    result = dict(base)
+    for k, v in override.items():
+        if k in result and isinstance(result[k], dict) and isinstance(v, dict):
+            result[k] = deep_merge(result[k], v)
+        elif k in result and isinstance(result[k], list) and isinstance(v, list):
+            # Par défaut : concaténer les listes
+            result[k] = result[k] + v
+        else:
+            result[k] = v
+    return result
+
+
+def load_provider_config(provider: str) -> dict:
+    """
+    Charge un fichier YAML provider, gère l'héritage via _inherit.
+    Exemple sustain.yaml :
+    _inherit: base.yaml
+    provider: SUSTAIN
+    source: {table: normalized.sustain}
+    """
+    cfg_path = CONFIG_DIR / f"{provider}.yaml"
+    if not cfg_path.exists():
+        raise FileNotFoundError(f"Config provider introuvable: {cfg_path}")
+
+    with cfg_path.open("r", encoding="utf-8") as f:
+        cfg = yaml.safe_load(f) or {}
+
+    if "_inherit" in cfg:
+        base_file = cfg["_inherit"]
+        base_path = CONFIG_DIR / base_file
+        if not base_path.exists():
+            raise FileNotFoundError(f"Base config introuvable: {base_path}")
+        with base_path.open("r", encoding="utf-8") as f:
+            base_cfg = yaml.safe_load(f) or {}
+        cfg = deep_merge(base_cfg, cfg)
+        cfg.pop("_inherit", None)
+
+    return cfg
