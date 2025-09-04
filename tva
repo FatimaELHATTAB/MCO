@@ -1,43 +1,30 @@
-📌 Contexte
+#!/bin/bash
+# create_project_structure.sh
+# Script pour créer l'arborescence du moteur de matching
 
-IEC enrichit quotidiennement la base RCX avec des informations pour suivre le cycle de vie des tiers.
+BASE_DIR="matching_engine"
 
-RCX est consultable/modifiable par IEC.
+mkdir -p $BASE_DIR/{config/{envs,providers},src/{core,utils,cli},tests/{unit,integration,regression/data},docker}
 
-Service RCX lié à votre besoin : batch stock objet SIREN MRCRXY003, envoi quotidien (pas de traitement RCX).
+# Fichiers de config
+touch $BASE_DIR/config/envs/dev.yaml
+touch $BASE_DIR/config/envs/prod.yaml
+touch $BASE_DIR/config/providers/base.yaml
+touch $BASE_DIR/config/providers/sustain.yaml
 
-Doc utilisateur disponible.
+# Code source
+touch $BASE_DIR/src/core/{pipeline.py,exact_matcher.py,fuzzy_matcher.py,tie_breaker.py,rules_loader.py,db_io.py}
+touch $BASE_DIR/src/utils/{logger.py,timer.py,normalizer.py,vault_client.py}
+touch $BASE_DIR/src/cli/entrypoint.py
+touch $BASE_DIR/src/__init__.py
 
-📌 Types d’appels disponibles
+# Tests
+touch $BASE_DIR/tests/unit/{test_exact_matcher.py,test_fuzzy_matcher.py,test_tie_breaker.py,test_rules_loader.py,test_db_io.py,test_normalizer.py}
+touch $BASE_DIR/tests/integration/test_pipeline_end_to_end.py
+touch $BASE_DIR/tests/regression/test_regression.py
+touch $BASE_DIR/tests/regression/data/{rmpm_sample.csv,sustain_sample.csv,expected_matches.csv}
 
-Appel en mode STOCK (hebdomadaire) → dispo en J et J-1.
+# Racine
+touch $BASE_DIR/{matching_prod_algorithm.py,Dockerfile,pyproject.toml,Makefile}
 
-Appel delta (quotidien) → création, suppression, changement.
-
-📌 Documentation
-
-Le data-catalogue est déjà présent dans la doc.
-
-📌 Next steps : Scoring
-
-Instance CVIT → passage obligatoire pour validation de la demande.
-
-Aucun fichier transmis (ni DEV, ni QUAL1) tant que le scoring n’est pas validé/invalidé.
-
-Mode de transmission dépend si intra-groupe ou non (architecture).
-
-👉 Actions :
-
-Voir avec Olivier pour préparer le scoring (inscription + support).
-
-CVIT décide si passage requis ou non.
-
-Le manuel est simple à envoyer.
-
-📌 Action UMD
-
-Vérifier si les données base certifiée sont bien présentes dans le doc.
-
-Spécifier la famille de données associée et le mode de transmission souhaité.
-
-Préparer le scoring ASAP.
+echo "✅ Arborescence créée sous $BASE_DIR"
