@@ -1,1 +1,31 @@
-Responsabilités Concevoir, développer et maintenir des services et bibliothèques Python utilisés en production. Optimiser la performance : scalabilité, gestion mémoire, parallélisation CPU/GPU, profiling et tuning. Structurer des pipelines de traitement de données efficaces (ex. Polars, DuckDB) et assurer la qualité des données. Définir les standards d’architecture et de code ; réaliser des revues de code et accompagner l’équipe. Mettre en place et faire respecter tests, CI/CD, gestion de configuration et stratégies de backup/résilience. Surveiller la production : logs structurés, métriques, alertes, documentation d’exploitation. Réaliser des benchmarks outillés pour sélectionner les librairies adaptées et défendre les choix techniques. Coopérer avec les équipes sécurité, conformité et métiers ; produire une documentation claire et auditable. Compétences requises 6+ ans en développement Python avancé en contexte production. Maîtrise des bibliothèques Python (standard + spécialisées : Pandas/Polars, NumPy, FastAPI, PyTest). Solide pratique du profiling (CPU, mémoire), optimisation et parallélisation. Connaissances des modèles d’API (FastAPI, Pydantic), contrats et gestion des versions. Bonnes pratiques logicielles : tests (unitaires/contract), CI/CD, code review, gestion des secrets. Rigueur documentaire et sens des exigences réglementaires (traçabilité, auditabilité). 
+Nous cherchons un·e développeur·se Python capable de produire du code robuste, lisible et performant, tout en s’impliquant dans les choix techniques.
+
+Missions
+
+Développer et maintenir des services et bibliothèques Python utilisés en production.
+
+Construire et optimiser des pipelines Polars (lazy, SQL) pour le traitement de gros volumes de données.
+
+Contribuer aux projets OCR/LLM pour transformer des documents financiers non structurés en données exploitables.
+
+Améliorer la performance (profiling, scalabilité, gestion mémoire, parallélisation CPU/GPU).
+
+Mettre en place les bonnes pratiques logicielles : tests, CI/CD, logging structuré, observabilité.
+
+Participer au déploiement cloud et aux choix d’architecture associés.
+
+Documenter et partager les choix techniques avec l’équipe, dans une logique de qualité et de long terme.
+
+Profil recherché
+
+Très bon niveau en Python (librairie standard, dataframes : Polars, Pandas, NumPy).
+
+Expérience concrète en profiling et optimisation (CPU/mémoire, lazy execution).
+
+Aisance avec la conception d’APIs (FastAPI, Pydantic) et l’intégration en prod.
+
+Pratique des environnements cloud (AWS, GCP ou Azure) et du déploiement CI/CD.
+
+Rigueur de développement : code propre, testé, maintenable.
+
+Capacité à travailler en équipe et à documenter clairement.
