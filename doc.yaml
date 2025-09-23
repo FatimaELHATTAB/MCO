@@ -1,0 +1,15 @@
+database:
+  table: "own_01188_tpn.t_norm_entity"
+
+  # Un SEUL template réutilisé pour left et right.
+  # On substitue {provider} par "RMPM" pour left, par le nom réel pour right.
+  base_condition: "date_fin IS NULL AND provider IN ('RMPM','{provider}') AND (matching_rule IS NULL OR matching_rule != 'fic')"
+
+ids:
+  left:  "ID_INTRN"   # id côté RMPM/left
+  right: "TGT_ID"     # id côté provider/right
+
+options:
+  distinct: true
+  limit_left: null     # ex 1000 en debug
+  limit_right: null
