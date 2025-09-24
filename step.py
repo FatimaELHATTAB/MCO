@@ -67,3 +67,74 @@ class MatchingPipelineLazy:
         ])
 
         return pl.concat([exact_df, fuzzy_df], how="diagonal_relaxed")
+
+
+
+import polars as pl
+from matching_engine.core.rules_loader import MatchingRule, RuleSet
+
+
+class ExactMatcherLazy:
+    """
+    Apply exact matching rules using Polars Lazy.
+    - Each MatchingRule contains:
+        * mpm_cols (columns on the left / RMPM side)
+        * provider_cols (columns on the right / Provider side)
+    - Performs an inner join on these columns and adds metadata (level, rule_name).
+    """
+
+    def __init__(self, left_id: str, right_id: str):
+        self.left_id = left_id
+        self.right_id = right_id
+
+    def apply_rule(
+        self,
+        left_lf: pl.LazyFrame,
+        right_lf: pl.LazyFrame,
+        rule: MatchingRule,
+    ) -> pl.LazyFrame:
+        """
+        Apply a single exact matching rule (inner join).
+        Returns a LazyFrame with standardized columns:
+          - left_id
+          - right_id
+          - level
+          - rule_name
+        """
+        return (
+            left_lf.join(
+                right_lf,
+                left_on=rule.mpm_cols,
+                right_on=rule.provider_cols,
+                how="inner",
+            )
+            .select([
+                pl.col(self.left_id).alias("left_id"),
+                pl.col(self.right_id).alias("right_id"),
+                pl.lit(rule.level).alias("level"),
+                pl.lit(rule.name).alias("rule_name"),
+            ])
+        )
+
+    def run_all(
+        self,
+        left_lf: pl.LazyFrame,
+        right_lf: pl.LazyFrame,
+        ruleset: RuleSet,
+    ) -> pl.LazyFrame:
+        """
+        Apply all exact rules from a RuleSet and concatenate the results.
+        ⚠️ No sequential filtering between rules.
+        Deduplication and filtering between rules should be handled
+        in the pipeline layer (MatchingPipelineLazy).
+        """
+        matches = []
+        for rule in ruleset.rules:
+            if rule.kind == "exact":
+                matches.append(self.apply_rule(left_lf, right_lf, rule))
+        if not matches:
+            return pl.LazyFrame()
+        return pl.concat(matches, how="diagonal")
+
+
+
