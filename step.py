@@ -1,151 +1,172 @@
 import pytest
 import polars as pl
+from pathlib import Path
+from rules_loader import (
+    MatchingRule,
+    RuleSet,
+    _infer_kind,
+    _level_sort_key,
+    _validate_rule,
+    _deep_merge,
+    _load_yaml_file,
+    _parse_rules,
+    load_rules_for_provider,
+)
 
-import db_client
+# ==============================================================
+# Helpers
+# ==============================================================
 
+def make_rule():
+    return MatchingRule(
+        level="Level1",
+        name="Test Rule",
+        rmpm_cols=["a", "b"],
+        provider_cols=["x", "y"],
+        kind="exact",
+        cardinality=2,
+    )
 
-# ---------- Fakes / Mocks ----------
-class FakeVaultClient:
-    def __init__(self, conf):
-        self.conf = conf
+# ==============================================================
+# MatchingRule & RuleSet
+# ==============================================================
 
-    def get_db_credentials(self):
-        return "user_test", "pwd_test"
-
-
-class FakePool:
-    def __init__(self, minconn, maxconn, **kwargs):
-        self.minconn = minconn
-        self.maxconn = maxconn
-        self.kwargs = kwargs
-        self.conn = FakeConn()
-        self.closed = False
-
-    def getconn(self):
-        return self.conn
-
-    def putconn(self, conn):
-        self.put_called = True
-
-    def closeall(self):
-        self.closed = True
-
-
-class FakeCursor:
-    def __init__(self, rows=None):
-        self.rows = rows or [(1, "a"), (2, "b")]
-        self.description = [("id",), ("name",)]
-
-    def execute(self, query, params=None):
-        self.executed = (query, params)
-
-    def fetchall(self):
-        return self.rows
-
-    def executemany(self, query, params):
-        self.executemany_called = (query, params)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc, tb):
-        pass
+def test_matching_rule_to_dict():
+    r = make_rule()
+    d = r.to_dict()
+    assert d["level"] == "Level1"
+    assert d["cardinality"] == 2
+    assert "rmpm" in d and "provider" in d
 
 
-class FakeConn:
-    def __init__(self):
-        self.cursor_obj = FakeCursor()
-        self.committed = False
+def test_ruleset_methods():
+    r = make_rule()
+    rs = RuleSet(provider="prov", rules=[r], schema={"a": pl.Utf8})
+    assert rs.by_kind("exact")[0] == r
+    assert rs.by_level("Level1") == r
+    assert rs.by_level("unknown") is None
+    d = rs.to_dict()
+    assert d["provider"] == "prov"
+    assert isinstance(d["rules"], list)
 
-    def cursor(self):
-        return self.cursor_obj
+# ==============================================================
+# Utils
+# ==============================================================
 
-    def commit(self):
-        self.committed = True
-
-
-# ---------- Fixtures ----------
-@pytest.fixture(autouse=True)
-def patch_dependencies(monkeypatch):
-    monkeypatch.setattr(db_client, "VaultClient", FakeVaultClient)
-    monkeypatch.setattr(db_client, "SimpleConnectionPool", FakePool)
-
-
-@pytest.fixture
-def db_conf():
-    class Conf:
-        host = "localhost"
-        port = 5432
-        name = "test_db"
-        sslmode = "require"
-    return Conf()
+def test_infer_kind():
+    assert _infer_kind("level1", "fuzzy rule") == "fuzzy"
+    assert _infer_kind("level1", "something") == "exact"
 
 
-@pytest.fixture
-def vault_conf():
-    class VaultConf:
-        path = "secret/path"
-    return VaultConf()
+def test_level_sort_key():
+    assert _level_sort_key("Level2") < _level_sort_key("Fuzzy")
+    assert _level_sort_key("Fuzzy")[0] == 1
 
 
-@pytest.fixture
-def client(db_conf, vault_conf):
-    return db_client.DbClient(db_conf=db_conf, vault_conf=vault_conf)
+def test_validate_rule_ok():
+    raw = {"matching_rule": "MyRule", "rmpm": ["a"], "provider": ["x"]}
+    rule = _validate_rule("Level1", raw)
+    assert rule.kind == "exact"
+    assert rule.cardinality == 1
 
 
-# ---------- Tests ----------
-
-def test_init_pool_creates_pool(client):
-    client._init_pool(minconn=1, maxconn=5)
-    pool = client._pool
-    assert isinstance(pool, FakePool)
-    assert pool.kwargs["dbname"] == client.db_conf.name
-    assert pool.kwargs["user"] == "user_test"
-    assert pool.kwargs["password"] == "pwd_test"
-
-
-def test_conn_and_put(client):
-    client._init_pool(1, 5)
-    conn = client._conn()
-    assert isinstance(conn, FakeConn)
-    client._put(conn)
-    assert getattr(client._pool, "put_called", False) is True
+@pytest.mark.parametrize("bad_raw", [
+    {},  # no matching_rule
+    {"matching_rule": "x"},  # no rmpm/provider
+    {"matching_rule": "x", "rmpm": [], "provider": ["a"]},  # empty lists
+    {"matching_rule": "x", "rmpm": ["a"], "provider": []},  # empty provider
+    {"matching_rule": "x", "rmpm": ["a"], "provider": ["x", "y"]},  # diff len
+])
+def test_validate_rule_errors(bad_raw):
+    with pytest.raises(ValueError):
+        _validate_rule("LevelX", bad_raw)
 
 
-def test_close_closes_pool(client):
-    client._init_pool(1, 5)
-    client.close()
-    assert client._pool.closed is True
+def test_deep_merge_dict_and_list():
+    base = {"a": 1, "b": {"x": 10}}
+    override = {"b": {"x": 20}, "c": 3}
+    result = _deep_merge(base, override)
+    assert result["b"]["x"] == 20
+    assert result["c"] == 3
+
+def test_deep_merge_non_dict():
+    assert _deep_merge(1, 2) == 2
+
+# ==============================================================
+# YAML + Parsing
+# ==============================================================
+
+def test_load_yaml_file(tmp_path):
+    path = tmp_path / "test.yaml"
+    path.write_text("x: 1")
+    assert _load_yaml_file(path)["x"] == 1
 
 
-def test_conn_without_pool_raises(client):
-    with pytest.raises(RuntimeError):
-        client._conn()
+def test_parse_rules_and_sort_ok(tmp_path):
+    data = {
+        "matching_criterias": {
+            "Level2": {"matching_rule": "R2", "rmpm": ["a"], "provider": ["b"]},
+            "Level1": {"matching_rule": "R1", "rmpm": ["a"], "provider": ["b"]},
+        }
+    }
+    rules = _parse_rules(data)
+    assert [r.level for r in rules] == ["Level1", "Level2"]
 
 
-def test_read_as_polars_basic(client):
-    client._init_pool(1, 5)
-    df = client.read_as_polars("SELECT * FROM t")
-    assert isinstance(df, pl.DataFrame)
-    assert df.shape == (2, 2)
-    assert "id" in df.columns
+@pytest.mark.parametrize("bad_data", [
+    {},  # missing matching_criterias
+    {"matching_criterias": []},  # not dict
+    {"matching_criterias": {"Level1": "not a dict"}},  # wrong type
+])
+def test_parse_rules_errors(bad_data):
+    with pytest.raises(ValueError):
+        _parse_rules(bad_data)
+
+# ==============================================================
+# load_rules_for_provider
+# ==============================================================
+
+def test_load_rules_for_provider_base_only(tmp_path):
+    base_yaml = tmp_path / "base.yaml"
+    base_yaml.write_text("""
+matching_criterias:
+  Level1:
+    matching_rule: "Test"
+    rmpm: ["a"]
+    provider: ["b"]
+schema:
+  col1: Utf8
+""")
+    rs = load_rules_for_provider("unknown", base_dir=tmp_path)
+    assert isinstance(rs, RuleSet)
+    assert rs.provider == "base"
+    assert list(rs.schema.keys()) == ["col1"]
 
 
-def test_read_as_polars_with_schema_and_params(client):
-    client._init_pool(1, 5)
-    schema = {"id": pl.Int64, "name": pl.Utf8}
-    df = client.read_as_polars("SELECT * FROM t WHERE id=%s", schema=schema, params=(1,))
-    assert df["id"].dtype == pl.Int64
-    assert df["name"].dtype == pl.Utf8
+def test_load_rules_for_provider_with_override(tmp_path):
+    base_yaml = tmp_path / "base.yaml"
+    prov_yaml = tmp_path / "prov.yaml"
+    base_yaml.write_text("""
+matching_criterias:
+  Level1:
+    matching_rule: "Base"
+    rmpm: ["a"]
+    provider: ["b"]
+""")
+    prov_yaml.write_text("""
+matching_criterias:
+  Level1:
+    matching_rule: "Override"
+    rmpm: ["x"]
+    provider: ["y"]
+schema:
+  col1: Utf8
+""")
+    rs = load_rules_for_provider("prov", base_dir=tmp_path)
+    assert rs.provider == "prov"
+    assert rs.rules[0].name == "Override"
 
 
-def test_insert_records_executes_and_commits(client, capsys):
-    client._init_pool(1, 5)
-    params = [{"a": 1}, {"a": 2}]
-    client.insert_records("INSERT INTO test VALUES (%s)", params)
-    conn = client._pool.conn
-    cur = conn.cursor_obj
-    assert cur.executemany_called[1] == params
-    assert conn.committed is True
-    out = capsys.readouterr().out
-    assert "Inserted" in out
+def test_load_rules_for_provider_missing_base(tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_rules_for_provider("prov", base_dir=tmp_path)
