@@ -1,94 +1,216 @@
-# tests/test_fic_prefilter.py
+# tests/test_db_client.py
+import builtins
+from types import SimpleNamespace
 import polars as pl
 import pytest
-from polars.testing import assert_frame_equal
 
-# ⚠️ adjust this import to your project layout
-from fic_prefilter import apply_fic_prefilter
+# 👉 adapte ce chemin d'import si ton module n'est pas à la racine
+import db_client as mod
 
-def lf(df: pl.DataFrame) -> pl.LazyFrame:
-    return df.lazy()
 
-def collect_sorted(lf_: pl.LazyFrame, by: str) -> pl.DataFrame:
-    return lf_.collect().sort(by)
+# -----------------------------
+# Doubles (mocks/fakes) locaux
+# -----------------------------
+class FakeCursor:
+    def __init__(self, rows=None, cols=None):
+        self._rows = rows or []
+        self._cols = cols or []
 
-def test_returns_lazyframes_and_noop_when_fic_pairs_empty():
-    left_in  = pl.DataFrame({"left_id": [1, 2, 3], "x": ["a", "b", "c"]})
-    right_in = pl.DataFrame({"right_id": [10, 20], "y": [0.1, 0.2]})
-    fic_pairs = pl.DataFrame({"intern_id": [], "target_id": []})
+    def __enter__(self):
+        return self
 
-    left_out_lf, right_out_lf = apply_fic_prefilter(
-        lf(left_in), lf(right_in), fic_pairs, left_id="left_id", right_id="right_id"
+    def __exit__(self, exc_type, exc, tb):
+        return False
+
+    def execute(self, query, params=None):
+        # on ne fait que mémoriser ce qui est passé
+        self.last_query = query
+        self.last_params = params
+
+        # Simule une description de colonnes comme psycopg2: tuple dont [0] = nom
+        self.description = [(c,) for c in self._cols]
+
+    def fetchall(self):
+        return self._rows
+
+    def executemany(self, query, params_seq):
+        self.last_query = query
+        self.last_params = list(params_seq)
+
+
+class FakeConnection:
+    def __init__(self, cursor: FakeCursor):
+        self._cursor = cursor
+        self.commits = 0
+
+    def cursor(self):
+        return self._cursor
+
+    def commit(self):
+        self.commits += 1
+
+
+class FakePool:
+    def __init__(self, *args, **kwargs):
+        # Mémorise les args passés pour les assertions
+        self.args = args
+        self.kwargs = kwargs
+        self._conn = None
+
+    def set_connection(self, conn):
+        self._conn = conn
+
+    def getconn(self):
+        if not self._conn:
+            raise RuntimeError("no fake connection set")
+        return self._conn
+
+    def putconn(self, conn):
+        # pas d'action, juste pour tracer
+        self._put_called_with = conn
+
+    def closeall(self):
+        self._closed = True
+
+
+class FakeVaultClient:
+    def __init__(self, _):
+        pass
+
+    def get_db_credentials(self):
+        return "db_user", "db_pwd"
+
+
+# -----------------------------
+# Fixtures de patch/mocks
+# -----------------------------
+@pytest.fixture(autouse=True)
+def patch_external_classes(monkeypatch):
+    """
+    Remplace dans le module testé:
+      - VaultClient par FakeVaultClient
+      - SimpleConnectionPool par FakePool
+    """
+    monkeypatch.setattr(mod, "VaultClient", FakeVaultClient, raising=True)
+    monkeypatch.setattr(mod, "SimpleConnectionPool", FakePool, raising=True)
+
+
+@pytest.fixture
+def db_conf():
+    # Remplace les dataclasses par un SimpleNamespace avec les mêmes attributs attendus
+    return SimpleNamespace(
+        host="localhost",
+        port=5432,
+        name="test_db",
+        sslmode="require",
     )
 
-    assert isinstance(left_out_lf, pl.LazyFrame)
-    assert isinstance(right_out_lf, pl.LazyFrame)
 
-    assert_frame_equal(collect_sorted(left_out_lf, "left_id"), left_in.sort("left_id"))
-    assert_frame_equal(collect_sorted(right_out_lf, "right_id"), right_in.sort("right_id"))
+@pytest.fixture
+def vault_conf():
+    return SimpleNamespace(path="secret/path")
 
-def test_removes_ids_present_in_fic_pairs_both_sides():
-    left_in  = pl.DataFrame({"lid": [1, 2, 3, 4], "x": ["a", "b", "c", "d"]})
-    right_in = pl.DataFrame({"rid": [10, 20, 30], "y": [0.1, 0.2, 0.3]})
-    # 2 must be removed from left, 20 & 99 requested on right but 99 not present (no-op)
-    fic_pairs = pl.DataFrame({"intern_id": [2, 2, 999], "target_id": [20, 99, 20]})
 
-    left_out_lf, right_out_lf = apply_fic_prefilter(
-        lf(left_in), lf(right_in), fic_pairs, left_id="lid", right_id="rid"
+@pytest.fixture
+def client(db_conf, vault_conf):
+    return mod.DbClient(db_conf=db_conf, vault_conf=vault_conf)
+
+
+# -----------------------------
+# Tests
+# -----------------------------
+def test_init_pool_creates_pool_and_uses_vault_credentials(client, db_conf, monkeypatch):
+    client._init_pool(minconn=1, maxconn=5)
+
+    # La pool a bien été créée
+    assert isinstance(client._pool, FakePool)
+
+    # Vérifie que les bons paramètres DB ont été passés au pool
+    kwargs = client._pool.kwargs
+    assert kwargs["dbname"] == db_conf.name
+    assert kwargs["user"] == "db_user"
+    assert kwargs["password"] == "db_pwd"
+    assert kwargs["host"] == db_conf.host
+    assert kwargs["port"] == db_conf.port
+    # sslmode peut ne pas exister selon ton code exact; adapte si besoin
+    assert kwargs.get("sslmode") in (None, db_conf.sslmode)
+
+
+def test_conn_raises_when_pool_not_initialized(client):
+    with pytest.raises(RuntimeError, match="pool not initialized"):
+        client._conn()  # méthode privée vue sur la capture
+
+
+def test_put_and_close_delegate_to_pool(client):
+    client._init_pool(1, 5)
+    fake_cursor = FakeCursor(rows=[], cols=["a"])
+    fake_conn = FakeConnection(fake_cursor)
+    client._pool.set_connection(fake_conn)
+
+    # get/put
+    c = client._conn()
+    client._put(c)
+    assert getattr(client._pool, "_put_called_with", None) is c
+
+    # close
+    client.close()
+    assert getattr(client._pool, "_closed", False) is True
+
+
+def test_read_as_polars_without_params_and_without_schema(client):
+    # Prépare une connexion renvoyant des lignes + colonnes
+    rows = [(1, "x"), (2, "y")]
+    cols = ["id", "label"]
+
+    client._init_pool(1, 5)
+    fake_cursor = FakeCursor(rows=rows, cols=cols)
+    fake_conn = FakeConnection(fake_cursor)
+    client._pool.set_connection(fake_conn)
+
+    df = client.read_as_polars("SELECT * FROM t", schema=None, params=None)
+
+    assert isinstance(df, pl.DataFrame)
+    assert df.shape == (2, 2)
+    assert set(df.columns) == set(cols)
+
+
+def test_read_as_polars_with_params_and_schema_cast(client):
+    rows = [("3", "42.5"), ("4", "13.0")]  # strings pour tester le cast
+    cols = ["id", "value"]
+
+    client._init_pool(1, 5)
+    fake_cursor = FakeCursor(rows=rows, cols=cols)
+    fake_conn = FakeConnection(fake_cursor)
+    client._pool.set_connection(fake_conn)
+
+    schema = {"id": pl.Int64, "value": pl.Float64}
+    df = client.read_as_polars(
+        "SELECT id, value FROM t WHERE id >= %s",
+        schema=schema,
+        params=(3,),
     )
 
-    expected_left  = pl.DataFrame({"lid": [1, 3, 4], "x": ["a", "c", "d"]}).sort("lid")
-    expected_right = pl.DataFrame({"rid": [10, 30], "y": [0.1, 0.3]}).sort("rid")
+    # Vérifie que l'exécution a bien reçu les params
+    assert fake_cursor.last_params == (3,)
 
-    assert_frame_equal(collect_sorted(left_out_lf, "lid"), expected_left)
-    assert_frame_equal(collect_sorted(right_out_lf, "rid"), expected_right)
+    # Vérifie le cast réalisé par with_columns(...)
+    assert df["id"].dtype == pl.Int64
+    assert df["value"].dtype == pl.Float64
+    assert df.shape == (2, 2)
 
-def test_no_overlap_means_no_change():
-    left_in  = pl.DataFrame({"id_left": [1, 2], "val": ["u", "v"]})
-    right_in = pl.DataFrame({"id_right": [10, 20], "val": ["p", "q"]})
-    fic_pairs = pl.DataFrame({"intern_id": [999], "target_id": [888]})
 
-    left_out_lf, right_out_lf = apply_fic_prefilter(
-        lf(left_in), lf(right_in), fic_pairs, left_id="id_left", right_id="id_right"
-    )
+def test_insert_records_executemany_and_commit(client, capsys):
+    client._init_pool(1, 5)
+    fake_cursor = FakeCursor()
+    fake_conn = FakeConnection(fake_cursor)
+    client._pool.set_connection(fake_conn)
 
-    assert_frame_equal(collect_sorted(left_out_lf, "id_left"), left_in.sort("id_left"))
-    assert_frame_equal(collect_sorted(right_out_lf, "id_right"), right_in.sort("id_right"))
+    params = [{"a": 1}, {"a": 2}, {"a": 3}]
+    client.insert_records("INSERT ...", params)
 
-def test_duplicates_in_fic_pairs_do_not_double_filter():
-    left_in  = pl.DataFrame({"L": [1, 2, 3, 4]})
-    right_in = pl.DataFrame({"R": [10, 20, 30, 40]})
-    # same id repeated many times; result should remove it once
-    fic_pairs = pl.DataFrame({"intern_id": [1, 1, 1, 1], "target_id": [20, 20, 20, 20]})
+    assert fake_cursor.last_query.startswith("INSERT")
+    assert fake_cursor.last_params == params
+    assert fake_conn.commits == 1
 
-    left_out_lf, right_out_lf = apply_fic_prefilter(
-        lf(left_in), lf(right_in), fic_pairs, left_id="L", right_id="R"
-    )
-
-    expected_left  = pl.DataFrame({"L": [2, 3, 4]}).sort("L")
-    expected_right = pl.DataFrame({"R": [10, 30, 40]}).sort("R")
-
-    assert_frame_equal(collect_sorted(left_out_lf, "L"), expected_left)
-    assert_frame_equal(collect_sorted(right_out_lf, "R"), expected_right)
-
-@pytest.mark.parametrize(
-    "left_col,right_col",
-    [
-        ("id", "id"),      # same name on both sides
-        ("a_left", "b_r"), # totally different names
-    ],
-)
-def test_custom_id_column_names_are_respected(left_col, right_col):
-    left_in  = pl.DataFrame({left_col: [1, 2, 3], "x": [0, 0, 0]})
-    right_in = pl.DataFrame({right_col: [10, 20, 30], "y": [1, 1, 1]})
-    fic_pairs = pl.DataFrame({"intern_id": [3], "target_id": [10]})
-
-    left_out_lf, right_out_lf = apply_fic_prefilter(
-        lf(left_in), lf(right_in), fic_pairs, left_id=left_col, right_id=right_col
-    )
-
-    expected_left  = left_in.filter(pl.col(left_col) != 3).sort(left_col)
-    expected_right = right_in.filter(pl.col(right_col) != 10).sort(right_col)
-
-    assert_frame_equal(collect_sorted(left_out_lf, left_col), expected_left)
-    assert_frame_equal(collect_sorted(right_out_lf, right_col), expected_right)
+    out = capsys.readouterr().out
+    assert "Inserted 3 new FIC records with clusters." in out
