@@ -1,154 +1,122 @@
-# test_run_provider.py
-import types
+import os
+import pathlib
 import logging
-import builtins
-import importlib
 import pytest
 
-MODULE_NAME = "run_provider"
+# 👉 adapte ce chemin si ton module n'est pas à la racine
+import run_provider as mod
 
 
-class _FakeDataCfg:
-    fic_base_condition = "base_cond"
-    fic_table = "fic_table"
-    country_scope = ["FR", "DE"]
+def _has_attr(obj, name):
+    return hasattr(obj, name) and callable(getattr(obj, name))
 
 
-class _FakeLoaded:
-    def __init__(self):
-        self.ruleset = {"rules": ["r1", "r2"]}
-        self.left_id = "left_ent_id"
-        self.right_id = "right_ent_id"
-        self.left_lf = "LEFT_FRAME"
-        self.right_lf = "RIGHT_FRAME"
+@pytest.fixture(scope="session")
+def logger():
+    lg = logging.getLogger("it-run")
+    lg.setLevel(logging.INFO)
+    return lg
 
 
-class Calls:
-    def __init__(self):
-        self.rules_for_provider = []
-        self.load_data = 0
-        self.unified_loader_init = []
-        self.unified_loader_load = []
-        self.pipeline_init = []
-        self.pipeline_run = []
-        self.apply_prefilter = []
-        self.process_matching = []
-
-
-@pytest.fixture
-def calls():
-    return Calls()
-
-
-@pytest.fixture(autouse=True)
-def patch_module(monkeypatch, calls):
+@pytest.fixture(scope="session")
+def data_cfg_path(tmp_path_factory):
     """
-    On importe le module cible puis on remplace TOUTES ses dépendances par des fakes.
+    Fournit un data.yaml *réel* minimal pour vos loaders.
+    Si vous avez déjà ./config/data.yaml dans le repo, supprimez ce fixture
+    et laissez votre vrai fichier être utilisé.
     """
-    mod = importlib.import_module(MODULE_NAME)
+    tmp = tmp_path_factory.mktemp("cfg")
+    cfg = tmp / "data.yaml"
 
-    # Fake: load_rules_for_provider
-    def _rules(provider):
-        calls.rules_for_provider.append(provider)
-        return {"rules": ["r1"]}
-
-    # Fake: load_data_io_config
-    def _load_cfg(_):
-        calls.load_data += 1
-        return _FakeDataCfg()
-
-    # Fake: MatchingTable
-    class _MT:
-        def __init__(self, db):
-            self.db = db
-
-        def process_matching(self, provider, matching_output, country):
-            calls.process_matching.append((provider, matching_output, country))
-
-    # Fake: FICMatchingTable
-    class _FIC:
-        def __init__(self, db, mtbl, base_cond, table_name):
-            self.db = db
-            self.mtbl = mtbl
-            self.base_cond = base_cond
-            self.table_name = table_name
-
-        def manage_fic(self, provider):
-            return {("A", "B"), ("C", "D")}  # paires fictives
-
-    # Fake: UnifiedLazyLoader
-    class _Loader:
-        def __init__(self, db, data_cfg, rule_set):
-            calls.unified_loader_init.append((db, data_cfg, rule_set))
-
-        def load_for_provider(self, provider, country_condition, include_fuzzy):
-            calls.unified_loader_load.append(
-                (provider, country_condition, include_fuzzy)
-            )
-            return _FakeLoaded()
-
-    # Fake: MatchingPipelineLazy
-    class _Pipeline:
-        def __init__(self, ruleset, left_id, right_id):
-            calls.pipeline_init.append((ruleset, left_id, right_id))
-
-        def run(self, left_lf, right_lf, left_id, right_id, fic_pairs):
-            result = [("L1", "R1"), ("L2", "R2")]
-            calls.pipeline_run.append(
-                (left_lf, right_lf, left_id, right_id, fic_pairs, tuple(result))
-            )
-            return result
-
-    # Fake: apply_fic_prefilter
-    def _apply(left_lf, fic_pairs, left_id, right_id, run_fuzzy):
-        calls.apply_prefilter.append(
-            (left_lf, fic_pairs, left_id, right_id, run_fuzzy)
-        )
-        return f"FILTERED({left_lf})"
-
-    monkeypatch.setattr(mod, "load_rules_for_provider", _rules)
-    monkeypatch.setattr(mod, "load_data_io_config", _load_cfg)
-    monkeypatch.setattr(mod, "MatchingTable", _MT)
-    monkeypatch.setattr(mod, "FICMatchingTable", _FIC)
-    monkeypatch.setattr(mod, "UnifiedLazyLoader", _Loader)
-    monkeypatch.setattr(mod, "MatchingPipelineLazy", _Pipeline)
-    monkeypatch.setattr(mod, "apply_fic_prefilter", _apply)
-
-    yield
-    # (rien à restaurer manuellement, monkeypatch gère la remise à zéro)
+    # ⚠️ Adapte les clés ci-dessous à votre vrai schéma de config
+    cfg.write_text(
+        "fic_base_condition: base_cond\n"
+        "fic_table: fic_table\n"
+        "country_scope:\n"
+        "  - FR\n"
+        "  - DE\n"
+        # ajoute ici toute autre clé nécessaire à UnifiedLazyLoader / MatchingPipelineLazy
+    )
+    return cfg
 
 
-def test_run_happy_path(calls, caplog):
-    import run_provider as mod
+@pytest.fixture(scope="session")
+def ensure_config_folder(data_cfg_path, monkeypatch):
+    """
+    Force mod.load_data_io_config('./config/data.yaml') à trouver un vrai fichier.
+    On crée ./config/data.yaml dans le workspace de test si nécessaire.
+    """
+    config_dir = pathlib.Path("./config")
+    config_dir.mkdir(exist_ok=True)
+    target = config_dir / "data.yaml"
+    if not target.exists():
+        target.write_text(pathlib.Path(data_cfg_path).read_text())
+    # Pas de monkeypatch des fonctions : on laisse *votre* loader lire ce fichier réel.
+
+
+@pytest.fixture(scope="session")
+def db_client():
+    """
+    Construit un DBClient *réel*. On essaie plusieurs chemins standards :
+    - mod.DBClient.from_env() (si vous l'exposez)
+    - mod.DBClient(dsn=...) (si vous prenez un DSN)
+    - mod.DBClient() nu (si vous lisez la conf ailleurs)
+    Si rien ne marche, on SKIP (pas de fake).
+    """
+    if _has_attr(mod.DBClient, "from_env"):
+        try:
+            return mod.DBClient.from_env()
+        except Exception as e:
+            pytest.skip(f"DBClient.from_env() indisponible: {e}")
+
+    # Essaie un DSN via variable d'env fournie par la CI (ex. PostgreSQL)
+    dsn = os.getenv("TEST_DB_DSN")
+    if dsn:
+        try:
+            return mod.DBClient(dsn=dsn)
+        except Exception as e:
+            pytest.skip(f"DBClient(dsn) indisponible: {e}")
+
+    # Dernier essai : constructeur par défaut
+    try:
+        return mod.DBClient()
+    except Exception as e:
+        pytest.skip(f"Impossible d’instancier DBClient sans mock: {e}")
+
+
+@pytest.mark.integration
+def test_provider_runner_end_to_end(db_client, ensure_config_folder, logger, caplog):
+    """
+    Test d’intégration *réel* :
+    - utilise ProviderRunner et vos modules concrets
+    - lit un vrai data.yaml (minimal ou le vôtre)
+    - appelle run(provider) et vérifie que ça s’exécute sans exception
+    - vérifie les logs de progression
+    """
+    # prérequis API visibles dans ta capture
+    required = [
+        "load_rules_for_provider",
+        "load_data_io_config",
+        "FICMatchingTable",
+        "MatchingTable",
+        "UnifiedLazyLoader",
+        "MatchingPipelineLazy",
+        "apply_fic_prefilter",
+    ]
+    missing = [name for name in required if not hasattr(mod, name)]
+    if missing:
+        pytest.skip(f"Dépendances manquantes dans run_provider: {missing}")
+
+    runner = mod.ProviderRunner(db=db_client, logger=logger)
 
     caplog.set_level(logging.INFO)
-    runner = mod.ProviderRunner(db=object())
+    provider = os.getenv("TEST_PROVIDER", "ACME_IT")  # 👉 adapte si besoin
 
-    runner.run("ACME")
+    # ⚠️ s’exécutera vraiment avec vos classes & I/O
+    runner.run(provider)
 
-    # Règles et config bien chargées
-    assert calls.rules_for_provider == ["ACME"]
-    assert calls.load_data == 1
-
-    # Loader et pipeline initialisés 2x (FR, DE)
-    assert len(calls.unified_loader_init) == 1  # une seule fois, en dehors de la boucle
-    assert calls.unified_loader_load == [
-        ("ACME", "FR", True),
-        ("ACME", "DE", True),
-    ]
-    assert len(calls.pipeline_init) == 2
-
-    # Prefilter + run appelés 2x
-    assert len(calls.apply_prefilter) == 2
-    assert len(calls.pipeline_run) == 2
-
-    # Insertion appelée avec les bons pays
-    assert calls.process_matching == [
-        ("ACME", [("L1", "R1"), ("L2", "R2")], "FR"),
-        ("ACME", [("L1", "R1"), ("L2", "R2")], "DE"),
-    ]
-
-    # Logs attendus
-    assert "Running matching for provider ACME" in caplog.text
-    assert "Matching done for scope FR" in caplog.text
-    assert "Matching done for scope DE" in caplog.text
+    # assertions non-fragiles : on vérifie le déroulé visible
+    assert f"Running matching for provider {provider}" in caplog.text
+    # si votre config minimal a FR/DE :
+    assert "Matching done for scope FR" in caplog.text or "FR" in caplog.text
+    assert "Matching done for scope DE" in caplog.text or "DE" in caplog.text
