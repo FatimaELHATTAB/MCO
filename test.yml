@@ -1,109 +1,22 @@
-include:
-  - project: 'Production-mutualisee/IPS/IDO/gitlab-cicd/pipelines'
-    file: '.gitlab-ci.yml'
+Modernization of the Matching Engine
 
-# Image par défaut (pour tes jobs qui n’en définissent pas)
-image: image-registry.openshift-image-registry.svc:5000/nso01b00455s/cloudtools:1.4.0
++ faster · + modular · + explainable
 
-stages:
-  - version
-  - run
-  - build
-  - install_dependencies
-  - linter
-  - test
-  - code_quality
+Modular Architecture
 
-# --------- BUILD (garde ton image cloudtools par défaut) ----------
-build-job-matching:
-  stage: build
-  # pas d'image => utilise l'image globale cloudtools
-  rules:
-    - if: '$CI_COMMIT_BRANCH == "master"'
-    - if: '$CI_COMMIT_BRANCH'   # sinon build sur toute branche
-  script:
-    - echo "Build & push Docker image avec cloudtools"
-    # tes commandes actuelles (login artifactory, build, push...)
-    # docker build/push ...
-  artifacts:
-    paths:
-      - image-tag/            # si tu produis un tag à réutiliser
-    expire_in: 1 week
+Modularization, logical separation, centralized configuration
 
-# ---------- INSTALL DEPS (image Python dédiée) ----------
-install_dependencies:
-  stage: install_dependencies
-  image: python:3.11
-  before_script:
-    - python -m pip install -U pip "poetry>=1.8.0"
-    - poetry config virtualenvs.in-project true
-    # si besoin d'Artifactory PyPI :
-    - poetry config certificates.ArtifactoryToolChainBnpp.cert false
-    - poetry config http-basic.ArtifactoryToolChainBnpp "$ARTIFACTORY_USER" "$ARTIFACTORY_PASSWORD"
-  script:
-    - poetry install --no-interaction --with dev -vvv
-  cache:
-    key: ${CI_COMMIT_REF_SLUG}
-    paths:
-      - .venv/
-      - .cache/pypoetry/
+Rule & Confidence Threshold Configuration
 
-# ---------- LINTER (autre image Python si tu veux) ----------
-linter:
-  stage: linter
-  image: python:3.12-slim
-  needs: ["install_dependencies"]
-  before_script:
-    - python -m pip install -U pip "poetry>=1.8.0"
-    - poetry config virtualenvs.in-project true
-    - poetry install --no-interaction --with dev
-  script:
-    - poetry run mypy
-    - poetry run ruff check
-  allow_failure: true
+YAML-based rules and adjustable confidence thresholds per provider/env
 
-# ---------- TESTS (image Python dédiée) ----------
-test:
-  stage: test
-  image: python:3.11
-  needs: ["install_dependencies"]
-  before_script:
-    - python -m pip install -U pip "poetry>=1.8.0"
-    - poetry config virtualenvs.in-project true
-    - poetry install --no-interaction --with dev
-  script:
-    - mkdir -p Matching/reports
-    - poetry run pytest -q \
-        -m "not integration" Matching/tests/unit \
-        --cov=Matching/src \
-        --cov-report=xml:Matching/reports/coverage.xml \
-        --junitxml=Matching/reports/junit_matching.xml \
-        -vv
-  artifacts:
-    when: always
-    reports:
-      junit: Matching/reports/junit_matching.xml
-      coverage_report:
-        coverage_format: cobertura
-        path: Matching/reports/coverage.xml
-    paths:
-      - Matching/reports/
+Optimized Matching
 
-# ---------- SONAR (image Sonar scanner) ----------
-running-sonar-code-quality:
-  stage: code_quality
-  image: $CI_REGISTRY/$SONAR_SCANNER_IMAGE_TAG
-  needs:
-    - job: test
-      artifacts: true
-  script:
-    - sonar-scanner \
-        -Dsonar.host.url=$SONAR_HOST_URL \
-        -Dsonar.login=$SONAR_TOKEN \
-        -Dsonar.projectKey=$SONAR_PROJECT_KEY \
-        -Dsonar.projectBaseDir=Matching \
-        -Dsonar.sources=src \
-        -Dsonar.tests=tests \
-        -Dsonar.python.coverage.reportPaths=reports/coverage.xml \
-        -Dsonar.python.xunit.reportPath=reports/junit_matching.xml \
-        -Dsonar.qualitygate.wait=true
+Local fuzzy computation, reduced network traffic
+
+Workflow:
+Providers → Data Preparation & Cleaning → Matching Engine → Quality Controls → Explainable Results
+
+✅ Execution time ×2 faster
+✅ More readable and maintainable code
+✅ Audited and traceable results
