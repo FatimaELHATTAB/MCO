@@ -1,274 +1,240 @@
-# tests/test_matching_insertion.py
-import types
-from datetime import datetime, timedelta
+# rapidfuzzy_matcher.py
+from __future__ import annotations
 
+import unicodedata
+from typing import List, Dict, Optional, Tuple
+import numpy as np
 import polars as pl
-import pytest
-
-# On importe la classe depuis ton module
-# adapte l'import si le nom du fichier/module diffère
-from matching_insertion import MatchingTable
+from rapidfuzz import process, fuzz, distance
 
 
-# ---------- Helpers / Fixtures ----------
-
-class FakeDB:
-    """DB client minimaliste pour capturer les requêtes et simuler les retours."""
-    def __init__(self, read_df: pl.DataFrame | None = None):
-        self.read_df = read_df if read_df is not None else pl.DataFrame()
-        self.last_query = None
-        self.last_params = None
-        self.insert_calls = []  # liste des (query, params)
-
-    def read_as_polars(self, query: str, schema=None):
-        self.last_query = query
-        # on ignore 'schema' volontairement
-        return self.read_df
-
-    def insert_records(self, query: str, params):
-        self.last_query = query
-        self.last_params = params
-        self.insert_calls.append((query, list(params)))
+# --- Scorers disponibles (référencés par nom dans ton YAML) ---
+SCORER_REGISTRY = {
+    "WRatio": fuzz.WRatio,
+    "QRatio": fuzz.QRatio,
+    "ratio": fuzz.ratio,
+    "partial_ratio": fuzz.partial_ratio,
+    "token_sort_ratio": fuzz.token_sort_ratio,
+    "token_set_ratio": fuzz.token_set_ratio,
+    "jaro_winkler": distance.JaroWinkler.normalized_similarity,
+    "lev": distance.Levenshtein.normalized_similarity,
+    # ajoute ici ceux dont tu as besoin
+}
 
 
-@pytest.fixture
-def monkeypatch_schema(monkeypatch):
-    # get_matching_table_schema n'est pas utile au test -> on le neutralise
-    import matching_insertion as mi
-    monkeypatch.setattr(mi, "get_matching_table_schema", lambda: None)
-    return monkeypatch
+# ---------- Utils vectorisés ----------
+def _norm(s: Optional[str]) -> str:
+    """Normalisation légère (one-shot) : trim, lower, déaccentuation."""
+    if s is None:
+        return ""
+    s = str(s).strip().lower()
+    s = unicodedata.normalize("NFKD", s)
+    return "".join(ch for ch in s if not unicodedata.combining(ch))
 
 
-@pytest.fixture
-def monkeypatch_recalc_identity(monkeypatch):
-    # recalculate_clusters : identité pour simplifier
-    import matching_insertion as mi
-    monkeypatch.setattr(mi, "recalculate_clusters", lambda df: df)
-    return monkeypatch
+def _cdist_col(
+    left_vals: List[str],
+    right_vals: List[str],
+    scorer,
+    cutoff: float = 0.0,
+    workers: int = -1,
+) -> np.ndarray:
+    """
+    Matrice |left| x |right| des similarités. Pruning via score_cutoff.
+    NB: fuzz.* -> [0..100], distance.* normalized_similarity -> [0..1].
+    """
+    M = process.cdist(left_vals, right_vals, scorer=scorer, score_cutoff=cutoff, workers=workers)
+    # Harmonise en [0..100] si nécessaire
+    if M.size and M.max() <= 1.0:
+        M = M * 100.0
+    return M.astype(float)
 
 
-# ---------- Tests load_provider_data ----------
-
-def test_load_provider_data_builds_expected_query(monkeypatch_schema):
-    df = pl.DataFrame({"intern_id": [1]})
-    fdb = FakeDB(read_df=df)
-    mt = MatchingTable(fdb, t_match="table_x")
-
-    out = mt.load_provider_data(provider_id="ProviderX")
-
-    assert out.shape == (1, 1)
-    q = fdb.last_query
-    assert "FROM table_x" in q
-    assert "ProviderX" in q
-    assert "matching_end_date IS NULL" in q
-    assert "closure_reason IS NULL" in q
-    assert "matching_rule != 'FIC'" in q
-
-
-# ---------- Tests format_matching_output ----------
-
-def test_format_matching_output_on_empty_returns_same():
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    empty = pl.DataFrame()
-    out = mt.format_matching_output(empty, provider="FR")
-
-    assert out.frame_equal(empty)
-
-
-def test_format_matching_output_maps_and_adds_columns():
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    raw = pl.DataFrame(
+def _matrix_to_df(
+    S: np.ndarray,
+    lblk: pl.DataFrame,
+    rblk: pl.DataFrame,
+    left_id: str,
+    right_id: str,
+    min_score: float,
+) -> pl.DataFrame:
+    if S.size == 0:
+        return pl.DataFrame({left_id: [], right_id: [], "score": []})
+    rows, cols = np.where(S >= min_score)
+    if rows.size == 0:
+        return pl.DataFrame({left_id: [], right_id: [], "score": []})
+    return pl.DataFrame(
         {
-            "right_id": [101],
-            "left_id": [202],
-            "intern_name": ["Alice"],
-            "target_name": ["ACME"],
+            left_id: lblk[left_id].to_numpy()[rows],
+            right_id: rblk[right_id].to_numpy()[cols],
+            "score": S[rows, cols].astype(float),
         }
     )
 
-    out = mt.format_matching_output(raw, provider="FR")
 
-    expected_cols = {
-        "intern_id",
-        "target_id",
-        "intern_name",
-        "target_name",
-        "matching_rule",
-        "matching_start_date",
-        "matching_end_date",
-        "closure_reason",
-        "is_duplicate",
-        "cluster_id",
-        "lisbon_decision",
-        "lisbon_date",
-        "lisbon_user",
-        "confidence_score",
-        "country",
-    }
-    assert set(out.columns) == expected_cols
-    row = out.row(0, named=True)
-    assert row["intern_id"] == 101
-    assert row["target_id"] == 202
-    assert row["country"] == "FR"
-
-
-# ---------- Tests generate_db_entries (logique de diff) ----------
-
-def test_generate_db_entries_labels_cover_all_cases():
-    mt = MatchingTable(FakeDB())
-
-    # Données actuelles (en base)
-    current = pl.DataFrame(
-        {
-            "intern_id": [1, 2, 3],
-            "target_id": ["A", "B", "C"],
-            "matching_rule": ["R", "R", "R"],
-            "cluster_id": ["C1", "C1", "C1"],
-        }
+def _topk_per_left(df: pl.DataFrame, k: int) -> pl.DataFrame:
+    """Top-k par left_id sans tri global (rank fenêtré)."""
+    if df.height == 0:
+        return df
+    return (
+        df.with_columns(
+            pl.col("score").rank(method="dense", descending=True).over("left_id").alias("rk")
+        )
+        .filter(pl.col("rk") <= k)
+        .drop("rk")
     )
 
-    # Nouvelles données:
-    # - intern 1 : target change A -> A2  => "Target Changed"
-    # - intern 2 : cluster change C1 -> C2 => "Cluster Changed"
-    # - intern 3 : disparaît                 => "Target Removed"
-    new = pl.DataFrame(
+
+# ---------- Classe principale ----------
+class RapidFuzzyMatcher:
+    """
+    Fuzzy matching vectorisé avec RapidFuzz + Polars.
+
+    Paramètres clés :
+      - columns: liste des colonnes côté left à comparer.
+      - peers: dict left_col -> right_col (colonnes homologues).
+      - scorers: dict col -> nom de scorer (cf. SCORER_REGISTRY).
+      - weights: dict col -> poids (float); 1.0 par défaut.
+      - global_min: seuil de score final (0..100).
+      - top_k: garder k meilleurs matches par left_id (None = tous).
+      - block_by_left / block_by_right: colonnes de blocking.
+    """
+
+    def __init__(
+        self,
+        left_id: str,
+        right_id: str,
+        columns: List[str],
+        peers: Dict[str, str],
+        scorers: Dict[str, str],
+        weights: Optional[Dict[str, float]] = None,
+        global_min: float = 90.0,
+        top_k: Optional[int] = None,
+        block_by_left: Optional[str] = None,
+        block_by_right: Optional[str] = None,
+    ):
+        self.left_id = left_id
+        self.right_id = right_id
+        self.columns = columns
+        self.peers = peers
+
+        # Compile les scorers une fois
+        self.scorers = {c: SCORER_REGISTRY[scorers[c]] for c in columns}
+
+        # Poids en array pour tensordot
+        self.weights = {c: (weights[c] if weights and c in weights else 1.0) for c in columns}
+        self._w_arr = np.array([self.weights[c] for c in columns], dtype=float)
+
+        self.global_min = float(global_min)
+        self.top_k = top_k
+        self.block_by_left = block_by_left
+        self.block_by_right = block_by_right
+
+        # Triplets (left_col, right_col, scorer) dans un ordre stable
+        self._cols_triplets: List[Tuple[str, str, object]] = [
+            (c, self.peers[c], self.scorers[c]) for c in self.columns
+        ]
+
+    # -------- API publique --------
+    def match(self, left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
+        """Retourne un DataFrame Polars: [left_id, right_id, score]."""
+
+        # Cast + fill une seule fois (évite erreurs de type & None)
+        need_cols_l = [self.left_id] + [c for c, _, _ in self._cols_triplets]
+        need_cols_r = [self.right_id] + [rc for _, rc, _ in self._cols_triplets]
+
+        left = (
+            left.select(need_cols_l)
+            .with_columns([pl.col(c).cast(pl.Utf8, strict=False).fill_null("") for c in need_cols_l])
+        )
+        right = (
+            right.select(need_cols_r)
+            .with_columns([pl.col(c).cast(pl.Utf8, strict=False).fill_null("") for c in need_cols_r])
+        )
+
+        results: List[pl.DataFrame] = []
+
+        # Blocking (intersection native Polars)
+        if self.block_by_left and self.block_by_right:
+            lvals = left.select(pl.col(self.block_by_left).unique()).to_series()
+            rvals = right.select(pl.col(self.block_by_right).unique()).to_series()
+            block_values = lvals.intersect(rvals)
+
+            for val in block_values:
+                lblk = left.filter(pl.col(self.block_by_left) == val)
+                rblk = right.filter(pl.col(self.block_by_right) == val)
+                if lblk.height and rblk.height:
+                    results.append(self._match_block_vectorized(lblk, rblk))
+        else:
+            results.append(self._match_block_vectorized(left, right))
+
+        if not results:
+            return pl.DataFrame(schema={self.left_id: pl.Utf8, self.right_id: pl.Utf8, "score": pl.Float64})
+
+        out = pl.concat(results, how="vertical_relaxed")
+        if self.top_k:
+            out = _topk_per_left(out, self.top_k)
+        return out
+
+    # -------- Détails internes --------
+    def _match_block_vectorized(self, lblk: pl.DataFrame, rblk: pl.DataFrame) -> pl.DataFrame:
+        """Calcule les similarités par colonne (cdist), agrège pondéré, puis filtre par seuil global."""
+        if lblk.height == 0 or rblk.height == 0:
+            return pl.DataFrame({self.left_id: [], self.right_id: [], "score": []})
+
+        # Normalisation en listes Python (one-shot)
+        left_norm_cols: List[List[str]] = []
+        right_norm_cols: List[List[str]] = []
+        for lcol, rcol, _ in self._cols_triplets:
+            left_norm_cols.append([_norm(x) for x in lblk[lcol].to_list()])
+            right_norm_cols.append([_norm(x) for x in rblk[rcol].to_list()])
+
+        # Matrices de similarité par colonne
+        mats: List[np.ndarray] = []
+        for (lvals, rvals), (_, _, scorer) in zip(zip(left_norm_cols, right_norm_cols), self._cols_triplets):
+            M = _cdist_col(lvals, rvals, scorer=scorer, cutoff=0.0, workers=-1)  # pruning fin par global_min
+            mats.append(M)
+
+        if not mats:
+            return pl.DataFrame({self.left_id: [], self.right_id: [], "score": []})
+
+        # Agrégation pondérée (shape: |L| x |R|)
+        S = np.tensordot(self._w_arr, np.stack(mats, axis=0), axes=(0, 0)) / self._w_arr.sum()
+
+        # Filtrage par seuil global
+        return _matrix_to_df(S, lblk, rblk, self.left_id, self.right_id, self.global_min)
+
+
+# --------------- Exemple d'utilisation ---------------
+if __name__ == "__main__":
+    # Petit exemple synthétique ; à supprimer dans ta prod.
+    left = pl.DataFrame(
         {
-            "intern_id": [1, 2],
-            "target_id": ["A2", "B"],
-            "matching_rule": ["R", "R"],
-            "cluster_id": ["C1", "C2"],
-        }
-    )
-
-    new_entries, to_close = mt.generate_db_entries(current, new)
-
-    # new_entries : les lignes qui n'existaient pas (anti-join complet)
-    # Ici : (1, A2, R, C1) et (2, B, R, C2)
-    assert new_entries.shape[0] == 2
-
-    # to_close doit contenir 3 lignes à fermer (les anciennes versions)
-    assert to_close.shape[0] == 3
-    # On vérifie la présence des trois motifs de fermeture
-    reasons = set(to_close["closure_reason"].to_list())
-    assert "Target Removed" in reasons
-    assert "Target Changed" in reasons or "Rule Changed" in reasons or "Cluster Changed" in reasons
-    assert "Cluster Changed" in reasons
-
-
-# ---------- Tests write_updated_data / _insert_new_data ----------
-
-def test_write_updated_data_no_updates_logs_and_returns(caplog):
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    mt.write_updated_data("ProviderX", pl.DataFrame())
-
-    # aucune insertion
-    assert fdb.insert_calls == []
-    # message d'info
-    assert any("No updates to write" in rec.message for rec in caplog.records)
-
-
-def test_write_updated_data_calls_private_insert(monkeypatch):
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    called = {"ok": False}
-
-    def _fake_insert(rows, batch_size):
-        called["ok"] = True
-        assert isinstance(rows, pl.DataFrame)
-        assert batch_size == 1000
-
-    monkeypatch.setattr(mt, "_insert_new_data", _fake_insert)
-
-    rows = pl.DataFrame(
-        {
-            "intern_id": [1],
-            "target_id": [2],
-            "intern_name": ["A"],
-            "target_name": ["B"],
-            "matching_rule": ["R"],
-            "matching_start_date": [datetime.utcnow()],
-            "matching_end_date": [None],
-            "closure_reason": [None],
-            "lisbon_decision": [None],
-            "lisbon_date": [None],
-            "lisbon_user": [None],
-            "cluster_id": ["C1"],
-            "confidence_score": [None],
-            "is_duplicate": [False],
-            "country": ["FR"],
-        }
-    )
-
-    mt.write_updated_data("ProviderX", rows)
-    assert called["ok"] is True
-
-
-def test__insert_new_data_batches_and_calls_db():
-    # 3 lignes, batch_size=2 => 2 appels (2 + 1)
-    rows = pl.DataFrame(
-        {
-            "intern_id": [1, 2, 3],
-            "target_id": [11, 22, 33],
-            "intern_name": ["a", "b", "c"],
-            "target_name": ["x", "y", "z"],
-            "matching_rule": ["R", "R", "R"],
-            "matching_start_date": [datetime.utcnow()] * 3,
-            "matching_end_date": [None, None, None],
-            "closure_reason": [None, None, None],
-            "lisbon_decision": [None, None, None],
-            "lisbon_date": [None, None, None],
-            "lisbon_user": [None, None, None],
-            "cluster_id": ["C1", "C1", "C1"],
-            "confidence_score": [None, None, None],
-            "is_duplicate": [False, False, False],
+            "left_id": ["A", "B", "C"],
+            "legal_name": ["Total Energies SE", "BNP Paribas", "Renault Group"],
             "country": ["FR", "FR", "FR"],
         }
     )
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    mt._insert_new_data(rows_to_update=rows, batch_size=2)
-
-    assert len(fdb.insert_calls) == 2
-    # tailles de batch : 2 puis 1
-    assert len(fdb.insert_calls[0][1]) == 2
-    assert len(fdb.insert_calls[1][1]) == 1
-
-
-# ---------- Tests update_closed_entries ----------
-
-def test_update_closed_entries_empty_noop():
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    mt.update_closed_entries(pl.DataFrame(), provider="ACME")
-
-    assert fdb.insert_calls == []
-
-
-def test_update_closed_entries_ok():
-    fdb = FakeDB()
-    mt = MatchingTable(fdb)
-
-    df_to_close = pl.DataFrame(
+    right = pl.DataFrame(
         {
-            "intern_id": [1, 2],
-            "closure_reason": ["Target Removed", "Cluster Changed"],
-            "matching_end_date": [datetime.utcnow(), datetime.utcnow() + timedelta(seconds=1)],
+            "right_id": ["r1", "r2", "r3"],
+            "lb_raisn_scial_cleaned": ["TotalEnergies", "BNP Paribas SA", "Groupe Renault"],
+            "incorp_country": ["FR", "FR", "FR"],
         }
     )
 
-    mt.update_closed_entries(df_to_close, provider="ACME", batch_size=10)
+    matcher = RapidFuzzyMatcher(
+        left_id="left_id",
+        right_id="right_id",
+        columns=["legal_name", "country"],
+        peers={"legal_name": "lb_raisn_scial_cleaned", "country": "incorp_country"},
+        scorers={"legal_name": "token_sort_ratio", "country": "ratio"},
+        weights={"legal_name": 0.8, "country": 0.2},
+        global_min=70.0,
+        top_k=2,
+        block_by_left="country",
+        block_by_right="incorp_country",
+    )
 
-    assert len(fdb.insert_calls) == 1
-    query, params = fdb.insert_calls[0]
-    assert "UPDATE" in query and "ACME" in query
-    # deux lignes envoyées
-    assert len(params) == 2
+    out = matcher.match(left, right)
+    print(out)
