@@ -1,87 +1,125 @@
 # rapidfuzzy_matcher.py
 from __future__ import annotations
 
-from typing import Dict, List, Optional, Callable
+import unicodedata
+import re
+from functools import lru_cache
+from typing import List, Dict, Optional, Tuple
 import numpy as np
 import polars as pl
-from rapidfuzz import fuzz, process, distance
+from rapidfuzz import process, fuzz, distance
 
 
-# ------------------------- Scorers (RF 2.15.1) -------------------------
-def _jw_100(a: str, b: str, **kwargs) -> float:
-    """
-    Jaro-Winkler normalisé sur 0..100.
-    **kwargs permet d'ignorer processor / score_cutoff envoyés par cdist().
-    """
-    return 100.0 * distance.JaroWinkler.normalized_similarity(a, b)
-
-
-SCORER_REGISTRY: Dict[str, Callable[[str, str], float]] = {
+# --------- Scorers dispos (références YAML) ----------
+SCORER_REGISTRY = {
+    "WRatio": fuzz.WRatio,
+    "QRatio": fuzz.QRatio,
     "ratio": fuzz.ratio,
     "partial_ratio": fuzz.partial_ratio,
-    "token_sort": fuzz.token_sort_ratio,
-    "token_set": fuzz.token_set_ratio,
-    "jw": _jw_100,
+    "token_sort_ratio": fuzz.token_sort_ratio,
+    "token_set_ratio": fuzz.token_set_ratio,
+    "jaro_winkler": distance.JaroWinkler.normalized_similarity,
+    "lev": distance.Levenshtein.normalized_similarity,
 }
 
 
-# ------------------------------ Utils ----------------------------------
-def _prep_strings(df: pl.DataFrame, cols: List[str]) -> pl.DataFrame:
-    """
-    Normalisation légère: cast en string, null -> "", trim, lower.
-    (Une seule fois avant le scoring)
-    """
-    exprs = []
-    for c in cols:
-        if c in df.columns:
-            exprs.append(
-                pl.col(c)
-                .cast(pl.Utf8, strict=False)
-                .fill_null("")
-                .str.strip_chars()
-                .str.to_lowercase()
-                .alias(c)
-            )
-    return df.with_columns(exprs) if exprs else df
+# --------- Cleaning robuste pour noms d'entreprise ----------
+class CompanyCleaner:
+    _punct_table = str.maketrans({c: " " for c in r"""!"#$%&'()*+,./:;<=>?@[\]^_`{|}~–—-"""} )
+    _spaces_re = re.compile(r"\s+")
+    _legal_suffix_re = re.compile(
+        r"\b("
+        r"sa|sas|sarl|eurl|sei|selarl|selas|sc|sasu|se|spa|s\.p\.a|ag|gmbh|kg|mbh|oy|bv|nv|ab|as|oyj|a/s|kft|k\.k\."
+        r"|ltd|llc|inc|corp|co|pte|pty|plc|llp|lp"
+        r")\b\.?", re.IGNORECASE
+    )
+    _stopwords_re = re.compile(r"\b(group|holding|company|co|inc|the|and|et|of)\b", re.IGNORECASE)
+
+    @staticmethod
+    def _strip_accents(s: str) -> str:
+        s = unicodedata.normalize("NFKD", s)
+        return "".join(ch for ch in s if not unicodedata.combining(ch))
+
+    @staticmethod
+    @lru_cache(maxsize=200_000)
+    def clean(token: str) -> str:
+        if token is None:
+            return ""
+        s = str(token).lower().strip()
+        if not s:
+            return ""
+        s = CompanyCleaner._strip_accents(s)
+        s = s.translate(CompanyCleaner._punct_table)
+        s = s.replace("&", " and ")
+        s = CompanyCleaner._legal_suffix_re.sub(" ", s)
+        s = CompanyCleaner._stopwords_re.sub(" ", s)
+        s = CompanyCleaner._spaces_re.sub(" ", s).strip()
+        return s
 
 
-def _cdist(
+# --------- Utils vectorisés ----------
+def _cdist_col(
     left_vals: List[str],
     right_vals: List[str],
-    scorer: Callable[[str, str], float],
-    cutoff: float,
+    scorer,
+    cutoff: float = 0.0,
+    workers: int = -1,
 ) -> np.ndarray:
-    """
-    Matrice de similarité (float32) en [0..100], prunée par score_cutoff.
-    Utilise tous les cœurs (workers=-1).
-    """
-    M = process.cdist(
-        left_vals,
-        right_vals,
-        scorer=scorer,
-        score_cutoff=cutoff,
-        workers=-1,
+    M = process.cdist(left_vals, right_vals, scorer=scorer, score_cutoff=cutoff, workers=workers)
+    # fuzz.* -> [0,100], distance.* -> [0,1]
+    if M.size and M.max() <= 1.0:
+        M = M * 100.0
+    return M.astype(float)
+
+
+def _matrix_to_df(
+    S: np.ndarray,
+    lblk: pl.DataFrame,
+    rblk: pl.DataFrame,
+    left_id: str,
+    right_id: str,
+    min_score: float,
+) -> pl.DataFrame:
+    if S.size == 0:
+        return pl.DataFrame({left_id: [], right_id: [], "score": []})
+    rows, cols = np.where(S >= min_score)
+    if rows.size == 0:
+        return pl.DataFrame({left_id: [], right_id: [], "score": []})
+    return pl.DataFrame(
+        {
+            left_id: lblk[left_id].to_numpy()[rows],
+            right_id: rblk[right_id].to_numpy()[cols],
+            "score": S[rows, cols].astype(float),
+        }
     )
-    # s'assure d'un dtype léger
-    return M.astype(np.float32, copy=False)
 
 
-# --------------------------- Classe principale --------------------------
+def _topk_per_left(df: pl.DataFrame, k: int) -> pl.DataFrame:
+    if df.height == 0:
+        return df
+    return (
+        df.with_columns(pl.col("score").rank(method="dense", descending=True).over("left_id").alias("rk"))
+          .filter(pl.col("rk") <= k)
+          .drop("rk")
+    )
+
+
+# --------- Matcher principal ----------
 class RapidFuzzyMatcher:
     """
-    Fuzzy matching vectorisé avec RapidFuzz (2.15.1) + Polars.
+    Fuzzy matching vectorisé (RapidFuzz + Polars) avec cleaning agressif.
 
-    Params
-    ------
-    left_id / right_id : noms des colonnes identifiants
-    columns            : colonnes à scorer côté left
-    peers              : mapping left_col -> right_col
-    scorers            : mapping col -> clé dans SCORER_REGISTRY
-    weights            : mapping col -> poids (float). Default = 1.0
-    global_min         : cutoff global (0..100). Paires < cutoff ignorées.
-    block_by_left      : colonne de blocking côté left (optionnel)
-    block_by_right     : colonne de blocking côté right (optionnel)
-    top_k              : conserver les k meilleurs candidats par left_id (optionnel)
+    Args:
+        columns: colonnes côté left
+        peers:   mapping left_col -> right_col
+        scorers: mapping col -> nom de scorer
+        weights: mapping col -> poids
+        global_min: seuil final (0..100)
+        top_k: meilleurs matches par left_id
+        block_by_left / block_by_right: colonnes de blocking
+        cutoff_by_col: seuils de pruning précoces par colonne (avant agrégation)
+        right_batch_size: pour limiter RAM quand les blocs sont gros
+        length_gate_ratio: si |lenL - lenR| / max(lenL,lenR) > ratio -> score annulé
     """
 
     def __init__(
@@ -93,134 +131,115 @@ class RapidFuzzyMatcher:
         scorers: Dict[str, str],
         weights: Optional[Dict[str, float]] = None,
         global_min: float = 90.0,
+        top_k: Optional[int] = None,
         block_by_left: Optional[str] = None,
         block_by_right: Optional[str] = None,
-        top_k: Optional[int] = None,
+        cutoff_by_col: Optional[Dict[str, float]] = None,
+        right_batch_size: int = 5000,
+        length_gate_ratio: float = 0.6,
+        workers: int = -1,
     ):
         self.left_id = left_id
         self.right_id = right_id
         self.columns = columns
-        self.peers = peers or {}
-        self.scores = scorers or {}
-        self.weights = weights or {c: 1.0 for c in columns}
+        self.peers = peers
+        self.scorers = {c: SCORER_REGISTRY[scorers[c]] for c in columns}
+        self.weights = {c: (weights[c] if weights and c in weights else 1.0) for c in columns}
+        self._w_arr = np.array([self.weights[c] for c in columns], dtype=float)
         self.global_min = float(global_min)
+        self.top_k = top_k
         self.block_by_left = block_by_left
         self.block_by_right = block_by_right
-        self.top_k = top_k
+        self.cutoff_by_col = cutoff_by_col or {}
+        self.right_batch_size = max(1000, int(right_batch_size))
+        self.length_gate_ratio = float(length_gate_ratio)
+        self.workers = workers
 
-        # validation des scorers
-        for c in self.columns:
-            key = self.scores.get(c)
-            if key not in SCORER_REGISTRY:
-                raise ValueError(
-                    f"Unknown scorer for column '{c}': {key!r}. "
-                    f"Valid: {list(SCORER_REGISTRY.keys())}"
-                )
+        self._cols_triplets: List[Tuple[str, str, object]] = [
+            (c, self.peers[c], self.scorers[c]) for c in self.columns
+        ]
 
-    # ----------------------------- API publique -----------------------------
-
+    # ---------- API ----------
     def match(self, left: pl.DataFrame, right: pl.DataFrame) -> pl.DataFrame:
-        """Retourne un DataFrame Polars: left_id, right_id, score (float)."""
-        if left.is_empty() or right.is_empty():
-            return self._empty_out()
+        need_cols_l = [self.left_id] + [c for c, _, _ in self._cols_triplets]
+        need_cols_r = [self.right_id] + [rc for _, rc, _ in self._cols_triplets]
 
-        # Colonnes à préparer (scoring + éventuels blocks)
-        left_cols = self.columns + ([self.block_by_left] if self.block_by_left else [])
-        right_cols = [self.peers.get(c, c) for c in self.columns] + (
-            [self.block_by_right] if self.block_by_right else []
-        )
+        left = (left.select(need_cols_l)
+                    .with_columns([pl.col(c).cast(pl.Utf8, strict=False).fill_null("") for c in need_cols_l]))
+        right = (right.select(need_cols_r)
+                     .with_columns([pl.col(c).cast(pl.Utf8, strict=False).fill_null("") for c in need_cols_r]))
 
-        left_prep = _prep_strings(left, [c for c in left_cols if c in left.columns])
-        right_prep = _prep_strings(right, [c for c in right_cols if c in right.columns])
+        results: List[pl.DataFrame] = []
 
         if self.block_by_left and self.block_by_right:
-            # valeurs communes des blocs
-            lvals = (
-                left_prep.select(pl.col(self.block_by_left).drop_nulls().unique())
-                .to_series()
-                .to_list()
-            )
-            rvals_set = set(
-                right_prep.select(pl.col(self.block_by_right).drop_nulls().unique())
-                .to_series()
-                .to_list()
-            )
-            common = [v for v in lvals if v in rvals_set]
-
-            results = []
-            for v in common:
-                lf = left_prep.filter(pl.col(self.block_by_left) == v)
-                rf = right_prep.filter(pl.col(self.block_by_right) == v)
-                if lf.height and rf.height:
-                    results.append(self._match_block(lf, rf))
-            out = pl.concat(results) if results else self._empty_out()
+            lvals = set(left[self.block_by_left].unique().to_list())
+            rvals = set(right[self.block_by_right].unique().to_list())
+            for val in lvals.intersection(rvals):
+                lblk = left.filter(pl.col(self.block_by_left) == val)
+                rblk = right.filter(pl.col(self.block_by_right) == val)
+                if lblk.height and rblk.height:
+                    results.extend(self._match_block_batched(lblk, rblk))
         else:
-            # pas de blocking -> 1 passe
-            out = self._match_block(left_prep, right_prep)
+            results.extend(self._match_block_batched(left, right))
 
+        if not results:
+            return pl.DataFrame(schema={self.left_id: pl.Utf8, self.right_id: pl.Utf8, "score": pl.Float64})
+
+        out = pl.concat(results, how="vertical_relaxed")
         if self.top_k:
-            out = (
-                out.sort(by=["left_id", "score"], descending=[False, True])
-                .group_by("left_id")
-                .head(self.top_k)
-            )
+            out = _topk_per_left(out, self.top_k)
         return out
 
-    # --------------------------- Implémentation ----------------------------
+    # ---------- Internes ----------
+    def _prep_clean_lists(self, df: pl.DataFrame, cols: List[str]) -> Dict[str, List[str]]:
+        # map unique -> cleaned via cache
+        cleaned: Dict[str, List[str]] = {}
+        for c in cols:
+            vals = df[c].to_list()
+            cleaned[c] = [CompanyCleaner.clean(v) for v in vals]
+        return cleaned
 
-    def _match_block(self, left_blk: pl.DataFrame, right_blk: pl.DataFrame) -> pl.DataFrame:
-        """Match vectorisé sur un bloc (ou sur tout le dataset s'il n'y a pas de bloc)."""
-        l_ids = left_blk[self.left_id].to_list()
-        r_ids = right_blk[self.right_id].to_list()
-        if not l_ids or not r_ids:
-            return self._empty_out()
+    def _length_gate_mask(self, L: List[str], R: List[str]) -> np.ndarray:
+        la = np.array([len(x) for x in L], dtype=np.int32)[:, None]
+        lb = np.array([len(x) for x in R], dtype=np.int32)[None, :]
+        mx = np.maximum(la, lb).astype(np.float32)
+        diff = np.abs(la - lb).astype(np.float32) / np.clip(mx, 1.0, None)
+        # mask 1 si diff <= ratio sinon 0
+        return (diff <= self.length_gate_ratio).astype(np.float32)
 
-        rcols = [self.peers.get(c, c) for c in self.columns]
-        scorer_funcs = [SCORER_REGISTRY[self.scores[c]] for c in self.columns]
-        weights = np.array([float(self.weights.get(c, 1.0)) for c in self.columns], dtype=np.float32)
-        wsum = float(weights.sum()) if float(weights.sum()) > 0 else 1.0
+    def _match_block_batched(self, lblk: pl.DataFrame, rblk: pl.DataFrame) -> List[pl.DataFrame]:
+        """Batches côté right pour contrôler la RAM."""
+        results: List[pl.DataFrame] = []
+        lcols = [c for c, _, _ in self._cols_triplets]
+        rcols = [rc for _, rc, _ in self._cols_triplets]
 
-        # valeurs par colonne (une seule fois)
-        L = {c: left_blk[c].to_list() for c in self.columns}
-        R = {c: right_blk[rc].to_list() for c, rc in zip(self.columns, rcols)}
+        Lclean = self._prep_clean_lists(lblk, lcols)
 
-        # matrices de scores par colonne
-        mats: List[np.ndarray] = []
-        for c, scorer, w in zip(self.columns, scorer_funcs, weights):
-            if w == 0:
-                continue
-            M = _cdist(L[c], R[c], scorer=scorer, cutoff=self.global_min)
-            if M.size == 0:
-                # si tout a été pruné par cutoff, on crée une matrice nulle de la bonne shape
-                M = np.zeros((len(L[c]), len(R[c])), dtype=np.float32)
-            mats.append(M * w)
+        # batching right
+        n = rblk.height
+        if n == 0 or lblk.height == 0:
+            return results
 
-        if not mats:
-            return self._empty_out()
+        for start in range(0, n, self.right_batch_size):
+            end = min(start + self.right_batch_size, n)
+            rchunk = rblk.slice(start, end - start)
+            Rclean = self._prep_clean_lists(rchunk, rcols)
 
-        # combinaison pondérée -> score final
-        S = np.add.reduce(mats) / wsum  # shape: (n_left, n_right)
+            mats: List[np.ndarray] = []
+            for (lcol, rcol, scorer) in self._cols_triplets:
+                cutoff = float(self.cutoff_by_col.get(lcol, 0.0))
+                M = _cdist_col(Lclean[lcol], Rclean[rcol], scorer=scorer, cutoff=cutoff, workers=self.workers)
+                mats.append(M)
 
-        # ne garder que >= cutoff
-        mask = S >= self.global_min
-        if not mask.any():
-            return self._empty_out()
+            S = np.tensordot(self._w_arr, np.stack(mats, axis=0), axes=(0, 0)) / self._w_arr.sum()
 
-        li = np.repeat(np.asarray(l_ids, dtype=object), S.shape[1]).reshape(S.shape)
-        ri = np.tile(np.asarray(r_ids, dtype=object), (S.shape[0], 1))
+            # Gate de longueur (annule scores trop divergents en taille)
+            mask = self._length_gate_mask(Lclean[lcols[0]], Rclean[rcols[0]])
+            # (on utilise la première colonne textuelle comme proxy; adapter au besoin)
+            S = S * mask
 
-        out = pl.DataFrame(
-            {
-                "left_id": li[mask].ravel().tolist(),
-                "right_id": ri[mask].ravel().tolist(),
-                "score": S[mask].ravel().astype(np.float32).tolist(),
-            },
-            schema={"left_id": pl.Utf8, "right_id": pl.Utf8, "score": pl.Float64},
-        )
-        return out
+            df_part = _matrix_to_df(S, lblk, rchunk, self.left_id, self.right_id, self.global_min)
+            if df_part.height:
+                results.append(df_part)
 
-    @staticmethod
-    def _empty_out() -> pl.DataFrame:
-        return pl.DataFrame(schema={"left_id": pl.Utf8, "right_id": pl.Utf8, "score": pl.Float64})
-
-
+        return results
