@@ -1,28 +1,130 @@
 import io
 import polars as pl
-import psycopg
 
-def copy_with_staging(conn, df: pl.DataFrame, target: str, staging: str, pk_cols: list[str]):
-    # 1) staging : idéalement UNLOGGED pour accélérer
-    with conn.cursor() as cur:
-        cur.execute(f"TRUNCATE {staging}")
+class TpnInsertion:
+    # ...
 
-    buf = io.StringIO()
-    df.write_csv(buf, include_header=False)
-    buf.seek(0)
-    cols = ", ".join(df.columns)
+    def _get_conn(self):
+        """
+        Adapte cette fonction à TON db_client.
+        Il faut récupérer une connexion psycopg2 (ou un cursor).
+        Exemples possibles:
+          - return self.db.conn
+          - return self.db.connection
+          - return self.db._conn
+        """
+        return self.db.conn  # <-- adapte si besoin
 
-    # 2) COPY into staging
-    with conn.cursor() as cur:
-        with cur.copy(f"COPY {staging} ({cols}) FROM STDIN WITH (FORMAT csv)") as copy:
-            copy.write(buf.getvalue())
+    def _get_pk_cols(self, full_table_name: str) -> list[str]:
+        """
+        Récupère automatiquement les colonnes de la PK (ou contrainte unique) pour ON CONFLICT.
+        Si ta table a une PK, c'est parfait.
+        """
+        schema, table = full_table_name.split(".", 1)
+        conn = self._get_conn()
 
-    # 3) merge vers target avec gestion conflit
-    conflict = ", ".join(pk_cols)
-    with conn.cursor() as cur:
-        cur.execute(f"""
-            INSERT INTO {target} ({cols})
-            SELECT {cols} FROM {staging}
-            ON CONFLICT ({conflict}) DO NOTHING
-        """)
-    conn.commit()
+        sql = """
+        SELECT a.attname
+        FROM pg_index i
+        JOIN pg_class c ON c.oid = i.indrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
+        WHERE n.nspname = %s AND c.relname = %s
+          AND (i.indisprimary OR i.indisunique)
+        ORDER BY i.indisprimary DESC, a.attnum
+        """
+        with conn.cursor() as cur:
+            cur.execute(sql, (schema, table))
+            cols = [r[0] for r in cur.fetchall()]
+
+        # On garde en priorité la PK ; sinon unique ; sinon on ne peut pas faire ON CONFLICT
+        return cols
+
+    def _ensure_staging_table(self, target_full_name: str, staging_full_name: str):
+        """
+        Crée une staging table si elle n'existe pas, avec le même schéma que la cible.
+        UNLOGGED = plus rapide (pas de WAL) -> OK si tu acceptes que ce soit non crash-safe.
+        """
+        conn = self._get_conn()
+        schema, _ = target_full_name.split(".", 1)
+        staging_schema, staging_table = staging_full_name.split(".", 1)
+
+        with conn.cursor() as cur:
+            # s'assure que le schéma existe (au cas où staging dans le même schema)
+            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {staging_schema};")
+
+            cur.execute(f"""
+                CREATE UNLOGGED TABLE IF NOT EXISTS {staging_full_name}
+                (LIKE {target_full_name} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING GENERATED);
+            """)
+
+        conn.commit()
+
+    def _insert_df(self, df: pl.LazyFrame, table_key: str):
+        """
+        Nouvelle version: COPY vers staging + upsert safe vers cible
+        """
+        if df is None:
+            return
+
+        # ⚠️ LazyFrame: df.is_empty() peut déclencher un scan.
+        # On fait un collect léger (streaming si possible) puis on teste.
+        pl_df = df.collect(streaming=True)
+        if pl_df.height == 0:
+            return
+
+        table_name = self.conf["tables"][table_key]["name"]
+        target_full_name = f"{self.schema}.{table_name}"
+        staging_full_name = f"{self.schema}.{table_name}__stg"
+
+        cols = pl_df.columns
+        col_list = ", ".join(cols)
+
+        conn = self._get_conn()
+
+        # 1) staging table
+        self._ensure_staging_table(target_full_name, staging_full_name)
+
+        # 2) truncate staging
+        with conn.cursor() as cur:
+            cur.execute(f"TRUNCATE {staging_full_name};")
+
+        # 3) COPY -> staging (CSV en mémoire)
+        buf = io.StringIO()
+        # En CSV mode, Postgres interprète en général champ vide non-quoté => NULL (par défaut).
+        pl_df.write_csv(buf, include_header=False)
+        buf.seek(0)
+
+        copy_sql = f"COPY {staging_full_name} ({col_list}) FROM STDIN WITH (FORMAT csv)"
+        with conn.cursor() as cur:
+            cur.copy_expert(copy_sql, buf)
+
+        # 4) Upsert safe -> target
+        conflict_cols = self.conf["tables"][table_key].get("conflict_cols")
+        if not conflict_cols:
+            # fallback: essaie de récupérer PK / unique automatiquement
+            conflict_cols = self._get_pk_cols(target_full_name)
+
+        if not conflict_cols:
+            # Dernier recours: pas de clé => on ne peut pas faire ON CONFLICT proprement.
+            # On insert "à l'aveugle" (risque de doublons) OU on lève une erreur.
+            raise ValueError(
+                f"Aucune PK/unique trouvée pour {target_full_name}. "
+                f"Ajoute conf['tables'][{table_key}]['conflict_cols']."
+            )
+
+        conflict = ", ".join(conflict_cols)
+
+        merge_sql = f"""
+            INSERT INTO {target_full_name} ({col_list})
+            SELECT {col_list} FROM {staging_full_name}
+            ON CONFLICT ({conflict}) DO NOTHING;
+        """
+
+        with conn.cursor() as cur:
+            cur.execute(merge_sql)
+
+        conn.commit()
+        self.logger.info(
+            f"COPY+UPSERT terminé: {pl_df.height} lignes -> {target_full_name} (staging={staging_full_name})"
+        )
