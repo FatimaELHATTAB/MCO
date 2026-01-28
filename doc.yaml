@@ -1,15 +1,28 @@
-database:
-  table: "own_01188_tpn.t_norm_entity"
+import io
+import polars as pl
+import psycopg
 
-  # Un SEUL template réutilisé pour left et right.
-  # On substitue {provider} par "RMPM" pour left, par le nom réel pour right.
-  base_condition: "date_fin IS NULL AND provider IN ('RMPM','{provider}') AND (matching_rule IS NULL OR matching_rule != 'fic')"
+def copy_with_staging(conn, df: pl.DataFrame, target: str, staging: str, pk_cols: list[str]):
+    # 1) staging : idéalement UNLOGGED pour accélérer
+    with conn.cursor() as cur:
+        cur.execute(f"TRUNCATE {staging}")
 
-ids:
-  left:  "ID_INTRN"   # id côté RMPM/left
-  right: "TGT_ID"     # id côté provider/right
+    buf = io.StringIO()
+    df.write_csv(buf, include_header=False)
+    buf.seek(0)
+    cols = ", ".join(df.columns)
 
-options:
-  distinct: true
-  limit_left: null     # ex 1000 en debug
-  limit_right: null
+    # 2) COPY into staging
+    with conn.cursor() as cur:
+        with cur.copy(f"COPY {staging} ({cols}) FROM STDIN WITH (FORMAT csv)") as copy:
+            copy.write(buf.getvalue())
+
+    # 3) merge vers target avec gestion conflit
+    conflict = ", ".join(pk_cols)
+    with conn.cursor() as cur:
+        cur.execute(f"""
+            INSERT INTO {target} ({cols})
+            SELECT {cols} FROM {staging}
+            ON CONFLICT ({conflict}) DO NOTHING
+        """)
+    conn.commit()
