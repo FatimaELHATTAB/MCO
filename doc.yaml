@@ -1,130 +1,186 @@
-import io
-import polars as pl
+UM – Prioritization (Golden Record)
+Context
 
-class TpnInsertion:
-    # ...
+We have multiple external sources (RPMM, OSR, RCX).
+All data is stored in a unified NORMALIZE model.
 
-    def _get_conn(self):
-        """
-        Adapte cette fonction à TON db_client.
-        Il faut récupérer une connexion psycopg2 (ou un cursor).
-        Exemples possibles:
-          - return self.db.conn
-          - return self.db.connection
-          - return self.db._conn
-        """
-        return self.db.conn  # <-- adapte si besoin
+Each source is matched independently, and equivalent entities are grouped into clusters.
 
-    def _get_pk_cols(self, full_table_name: str) -> list[str]:
-        """
-        Récupère automatiquement les colonnes de la PK (ou contrainte unique) pour ON CONFLICT.
-        Si ta table a une PK, c'est parfait.
-        """
-        schema, table = full_table_name.split(".", 1)
-        conn = self._get_conn()
+We need an API to compute the best values for each entity, based on:
 
-        sql = """
-        SELECT a.attname
-        FROM pg_index i
-        JOIN pg_class c ON c.oid = i.indrelid
-        JOIN pg_namespace n ON n.oid = c.relnamespace
-        JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum = ANY(i.indkey)
-        WHERE n.nspname = %s AND c.relname = %s
-          AND (i.indisprimary OR i.indisunique)
-        ORDER BY i.indisprimary DESC, a.attnum
-        """
-        with conn.cursor() as cur:
-            cur.execute(sql, (schema, table))
-            cols = [r[0] for r in cur.fetchall()]
+the sources present in the cluster,
 
-        # On garde en priorité la PK ; sinon unique ; sinon on ne peut pas faire ON CONFLICT
-        return cols
+business priority rules.
 
-    def _ensure_staging_table(self, target_full_name: str, staging_full_name: str):
-        """
-        Crée une staging table si elle n'existe pas, avec le même schéma que la cible.
-        UNLOGGED = plus rapide (pas de WAL) -> OK si tu acceptes que ce soit non crash-safe.
-        """
-        conn = self._get_conn()
-        schema, _ = target_full_name.split(".", 1)
-        staging_schema, staging_table = staging_full_name.split(".", 1)
+Global idea (simple)
 
-        with conn.cursor() as cur:
-            # s'assure que le schéma existe (au cas où staging dans le même schema)
-            cur.execute(f"CREATE SCHEMA IF NOT EXISTS {staging_schema};")
+The system works at cluster level.
 
-            cur.execute(f"""
-                CREATE UNLOGGED TABLE IF NOT EXISTS {staging_full_name}
-                (LIKE {target_full_name} INCLUDING DEFAULTS INCLUDING CONSTRAINTS INCLUDING GENERATED);
-            """)
+A cluster represents the same entity coming from different sources.
 
-        conn.commit()
+The API:
 
-    def _insert_df(self, df: pl.LazyFrame, table_key: str):
-        """
-        Nouvelle version: COPY vers staging + upsert safe vers cible
-        """
-        if df is None:
-            return
+looks at all entities in the cluster,
 
-        # ⚠️ LazyFrame: df.is_empty() peut déclencher un scan.
-        # On fait un collect léger (streaming si possible) puis on teste.
-        pl_df = df.collect(streaming=True)
-        if pl_df.height == 0:
-            return
+identifies which sources are present,
 
-        table_name = self.conf["tables"][table_key]["name"]
-        target_full_name = f"{self.schema}.{table_name}"
-        staging_full_name = f"{self.schema}.{table_name}__stg"
+and selects the best value for each field.
 
-        cols = pl_df.columns
-        col_list = ", ".join(cols)
+How it works (high level)
 
-        conn = self._get_conn()
+When the API is called:
 
-        # 1) staging table
-        self._ensure_staging_table(target_full_name, staging_full_name)
+We read the matching table to get all entities in the same cluster
 
-        # 2) truncate staging
-        with conn.cursor() as cur:
-            cur.execute(f"TRUNCATE {staging_full_name};")
+We count the distinct sources in this cluster
 
-        # 3) COPY -> staging (CSV en mémoire)
-        buf = io.StringIO()
-        # En CSV mode, Postgres interprète en général champ vide non-quoté => NULL (par défaut).
-        pl_df.write_csv(buf, include_header=False)
-        buf.seek(0)
+These sources define the scope of prioritization
 
-        copy_sql = f"COPY {staging_full_name} ({col_list}) FROM STDIN WITH (FORMAT csv)"
-        with conn.cursor() as cur:
-            cur.copy_expert(copy_sql, buf)
+We extract candidate values from NORMALIZE
 
-        # 4) Upsert safe -> target
-        conflict_cols = self.conf["tables"][table_key].get("conflict_cols")
-        if not conflict_cols:
-            # fallback: essaie de récupérer PK / unique automatiquement
-            conflict_cols = self._get_pk_cols(target_full_name)
+We apply priority rules
 
-        if not conflict_cols:
-            # Dernier recours: pas de clé => on ne peut pas faire ON CONFLICT proprement.
-            # On insert "à l'aveugle" (risque de doublons) OU on lève une erreur.
-            raise ValueError(
-                f"Aucune PK/unique trouvée pour {target_full_name}. "
-                f"Ajoute conf['tables'][{table_key}]['conflict_cols']."
-            )
+We return / store the certified values
 
-        conflict = ", ".join(conflict_cols)
+Simple schema (mental model)
+Client
+  |
+  v
+API Prioritization
+  |
+  v
+Matching table
+  |
+  v
+Cluster (list of sources)
+  |
+  v
+Normalize
+  |
+  v
+Priority rules
+  |
+  v
+Certified values
 
-        merge_sql = f"""
-            INSERT INTO {target_full_name} ({col_list})
-            SELECT {col_list} FROM {staging_full_name}
-            ON CONFLICT ({conflict}) DO NOTHING;
-        """
+Example (very concrete)
+Matching table
 
-        with conn.cursor() as cur:
-            cur.execute(merge_sql)
+Cluster CL_42:
 
-        conn.commit()
-        self.logger.info(
-            f"COPY+UPSERT terminé: {pl_df.height} lignes -> {target_full_name} (staging={staging_full_name})"
-        )
+cluster_id	source	src_id
+CL_42	OSR	123
+CL_42	RPMM	908
+CL_42	RCX	77
+
+So:
+
+sources_in_cluster = {OSR, RPMM, RCX}
+
+Normalize (legal_name)
+source	src_id	legal_name
+OSR	123	BNP PARIBAS
+RCX	77	BNP PARIBAS SA
+RPMM	908	NULL
+Priority rules
+field	source	rank
+legal_name	RCX	1
+legal_name	OSR	2
+legal_name	RPMM	3
+Result
+
+The API returns:
+
+legal_name = "BNP PARIBAS SA"
+source = RCX
+
+Why cluster is important
+
+The cluster defines which sources are compared.
+
+We never compare:
+
+RCX with Bloomberg
+
+or OSR with a source that is not in the cluster
+
+We only compare:
+
+sources that really represent the same entity.
+
+This makes the prioritization:
+
+correct
+
+local
+
+efficient
+
+Performance principle
+
+The API never scans all data.
+
+It only works on:
+
+entities inside one cluster
+
+
+So the cost depends on:
+
+cluster size
+not on:
+
+total volume of NORMALIZE
+
+This makes the system fast and scalable.
+
+Summary (in one sentence)
+
+The API takes a cluster, looks at the sources inside it, and selects the best value for each field using business priority rules.
+
+(Optional – future optimization)
+
+We could store a table like:
+
+CERTIFIED_PROVENANCE
+(cert_id, field, source)
+
+
+So we can skip recalculation if a new source is less prioritary.
+
+This is only an optimization layer, not required for the first version.
+
+Pourquoi ce format est exactement ce que tu veux
+
+Parce que là on est :
+
+même style que ton screenshot
+
+anglais simple
+
+phrases courtes
+
+pas de jargon inutile
+
+schéma mental clair
+
+lisible par :
+
+dev backend
+
+data engineer
+
+product
+
+manager
+
+C’est typiquement le style qu’on trouve dans :
+
+bons repos Git
+
+docs d’équipes plateforme
+
+specs d’API propres
+
+Et surtout :
+👉 quelqu’un peut lire en 2 minutes et dire “ok j’ai compris comment ça marche”.
