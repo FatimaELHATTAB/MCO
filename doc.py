@@ -168,3 +168,43 @@ class TpnInsertion:
         finally:
             # If safe=True, temp table disappears at session end; we just close.
             conn.close()
+
+
+
+-- ============================================================
+-- Priority rules table (no historization, no target_table)
+--  - field_name: business field to prioritize (e.g. legal_name)
+--  - source:     data source (e.g. RCX, OSR, RPMM)
+--  - priority:   1 = highest priority
+-- ============================================================
+
+CREATE TABLE IF NOT EXISTS priority_rules (
+    field_name  VARCHAR(100) NOT NULL,
+    source      VARCHAR(50)  NOT NULL,
+    priority    INTEGER      NOT NULL CHECK (priority > 0),
+
+    CONSTRAINT pk_priority_rules PRIMARY KEY (field_name, source)
+);
+
+-- Avoid ambiguous rankings: for a given field, one priority = one source
+CREATE UNIQUE INDEX IF NOT EXISTS uq_priority_rules_field_priority
+    ON priority_rules (field_name, priority);
+
+-- Helpful for lookups (optional, but usually useful)
+CREATE INDEX IF NOT EXISTS ix_priority_rules_field
+    ON priority_rules (field_name);
+
+CREATE INDEX IF NOT EXISTS ix_priority_rules_source
+    ON priority_rules (source);
+
+-- ------------------------------------------------------------
+-- Example seed (optional) - delete if you don't want seed data
+-- ------------------------------------------------------------
+-- INSERT INTO priority_rules (field_name, source, priority) VALUES
+--   ('legal_name', 'RCX', 1),
+--   ('legal_name', 'OSR', 2),
+--   ('legal_name', 'RPMM', 3),
+--   ('city',       'OSR', 1),
+--   ('city',       'RPMM', 2)
+-- ON CONFLICT (field_name, source) DO UPDATE
+-- SET priority = EXCLUDED.priority;
