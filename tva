@@ -1,1 +1,176 @@
-...
+# prioritization_queries.yml
+
+find_cluster_by_key: |
+  SELECT cluster_id, tpn_id
+  FROM matching
+  WHERE flux_source = %(flux_source)s
+    AND local_id = %(local_id)s
+  ORDER BY updated_at DESC NULLS LAST
+  LIMIT 1;
+
+list_cluster_members: |
+  SELECT flux_source, local_id
+  FROM matching
+  WHERE cluster_id = %(cluster_id)s;
+
+list_fields_for_sources: |
+  SELECT DISTINCT field_name
+  FROM priority_rules
+  WHERE flux_source = ANY(%(sources)s);
+
+load_priority_rules: |
+  SELECT field_name, flux_source, priority
+  FROM priority_rules
+  WHERE field_name = ANY(%(field_names)s)
+    AND flux_source = ANY(%(sources)s);
+
+load_candidates_for_cluster: |
+  SELECT
+    n.flux_source,
+    n.local_id,
+    {{COLUMNS}}
+  FROM legal_entity_normalized n
+  JOIN matching m
+    ON n.flux_source = m.flux_source
+   AND n.local_id = m.local_id
+  WHERE m.cluster_id = %(cluster_id)s;
+
+
+
+# query_loader.py
+from __future__ import annotations
+from pathlib import Path
+import yaml
+
+def load_queries(path: str | Path) -> dict:
+    with Path(path).open("r", encoding="utf-8") as f:
+        return yaml.safe_load(f) or {}
+
+
+
+# prioritizer.py
+from __future__ import annotations
+
+from typing import Any
+import re
+import polars as pl
+
+from query_loader import load_queries
+
+
+_IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+
+def _safe_col(name: str) -> str:
+    """Very strict identifier validation to avoid SQL injection via field names."""
+    if not _IDENT.match(name):
+        raise ValueError(f"Invalid column name: {name}")
+    return f'n."{name}"'
+
+def _render(sql: str, *, columns: list[str]) -> str:
+    cols_sql = ",\n    ".join(_safe_col(c) for c in columns)
+    return sql.replace("{{COLUMNS}}", cols_sql)
+
+def prioritize_legal_entity(
+    db,  # your DbClient
+    flux_source: str,
+    local_id: str,
+    queries_path: str = "prioritization_queries.yml",
+    default_priority_when_missing: int = 1_000_000,
+    exclude_fields: set[str] | None = None,
+) -> dict[str, Any]:
+    """
+    Minimal engine:
+      input = (flux_source, local_id)
+      output = dict with tpn_id, cluster_id, values, winners_df
+    """
+    exclude_fields = exclude_fields or {"flux_source", "local_id"}
+
+    q = load_queries(queries_path)
+
+    # 1) find cluster + tpn_id
+    df_cluster = db.read_as_polars(
+        q["find_cluster_by_key"],
+        params={"flux_source": flux_source, "local_id": local_id},
+    )
+    if df_cluster.is_empty():
+        raise ValueError(f"No cluster found for ({flux_source}, {local_id})")
+
+    cluster_id = str(df_cluster["cluster_id"][0])
+    tpn_id = str(df_cluster["tpn_id"][0])
+
+    # 2) list cluster members -> sources scope
+    df_members = db.read_as_polars(
+        q["list_cluster_members"],
+        params={"cluster_id": cluster_id},
+    )
+    sources = sorted(df_members["flux_source"].unique().to_list())
+
+    # 3) list fields governed for these sources
+    df_fields = db.read_as_polars(
+        q["list_fields_for_sources"],
+        params={"sources": sources},
+    )
+    fields = sorted(set(df_fields["field_name"].to_list()) - exclude_fields)
+
+    if not fields:
+        return {"tpn_id": tpn_id, "cluster_id": cluster_id, "sources": sources, "values": {}, "winners": pl.DataFrame()}
+
+    # 4) load candidates (only these columns)
+    sql_candidates = _render(q["load_candidates_for_cluster"], columns=fields)
+    df_candidates = db.read_as_polars(sql_candidates, params={"cluster_id": cluster_id})
+
+    if df_candidates.is_empty():
+        return {"tpn_id": tpn_id, "cluster_id": cluster_id, "sources": sources, "values": {}, "winners": pl.DataFrame()}
+
+    # 5) load priority rules
+    df_prio = db.read_as_polars(
+        q["load_priority_rules"],
+        params={"field_names": fields, "sources": sources},
+    )
+
+    # 6) compute winners in polars
+    long_df = df_candidates.melt(
+        id_vars=["flux_source", "local_id"],
+        value_vars=fields,
+        variable_name="field_name",
+        value_name="value",
+    ).filter(pl.col("value").is_not_null())
+
+    # remove empty strings (simple + safe)
+    long_df = long_df.with_columns(
+        pl.when(pl.col("value").dtype == pl.Utf8)
+        .then(pl.col("value").str.strip_chars())
+        .otherwise(pl.col("value"))
+        .alias("value")
+    ).filter(
+        pl.when(pl.col("value").dtype == pl.Utf8).then(pl.col("value") != "").otherwise(pl.lit(True))
+    )
+
+    ranked = (
+        long_df.join(df_prio, on=["field_name", "flux_source"], how="left")
+        .with_columns(pl.col("priority").fill_null(default_priority_when_missing).cast(pl.Int64))
+        .sort(["field_name", "priority", "flux_source", "local_id"])
+    )
+
+    winners = (
+        ranked.group_by("field_name")
+        .agg([
+            pl.first("value").alias("value"),
+            pl.first("flux_source").alias("winner_source"),
+            pl.first("local_id").alias("winner_local_id"),
+            pl.first("priority").alias("winner_priority"),
+        ])
+        .sort("field_name")
+    )
+
+    values = dict(zip(winners["field_name"].to_list(), winners["value"].to_list(), strict=True))
+
+    return {
+        "tpn_id": tpn_id,
+        "cluster_id": cluster_id,
+        "sources": sources,
+        "values": values,
+        "winners": winners,
+    }
+
+
