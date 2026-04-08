@@ -1,141 +1,70 @@
-from __future__ import annotations
+new_data = recalculate_clusters(df_formated)
 
-from decimal import Decimal
-from datetime import date, datetime, time
-from typing import Any
+cluster_stats_df = self.build_cluster_stats_from_df(new_data)
+
+tpn.insert_df(new_data, table_key="matching")
+
+if not cluster_stats_df.is_empty():
+    tpn.insert_df(cluster_stats_df, table_key="cluster_stats")
+
+remaining_data = self.filter_clustered_rows(new_data, cluster_stats_df)
+
+self.pipeline_priorization(remaining_data)
+
+
+
+----------
+
+def filter_clustered_rows(self, new_data: pl.DataFrame, cluster_stats_df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Retire de new_data les lignes appartenant aux clusters déjà sortis vers cluster_stats.
+    """
+
+    if new_data.is_empty() or cluster_stats_df.is_empty():
+        return new_data
+
+    clustered_ids = cluster_stats_df.select("cluster_id").unique()
+
+    remaining_data = new_data.join(
+        clustered_ids,
+        on="cluster_id",
+        how="anti"
+    )
+
+    return remaining_data
+
+
+------------
+
+
 
 import polars as pl
 
 
-class DbClient:
-    def read_as_polars(
-        self,
-        query: str,
-        schema: dict[str, pl.DataType] | None = None,
-        params: tuple | dict | None = None,
-    ) -> pl.DataFrame:
-        """
-        Exécute une requête SQL et retourne un DataFrame Polars robuste.
+def build_cluster_stats_from_df(self, df: pl.DataFrame) -> pl.DataFrame:
+    """
+    Construit les cluster_stats directement depuis le dataframe du batch courant.
+    """
 
-        Comportement:
-        - schema=None:
-            tente une inférence Polars après normalisation des valeurs
-            puis fallback en Utf8 si une colonne contient des types mixtes
-        - schema fourni:
-            applique le schéma explicitement
+    if df.is_empty():
+        return pl.DataFrame()
 
-        Hypothèse:
-        - self._conn() retourne une connexion DB-API 2.0
-        """
-        conn = self._conn()
+    cluster_stats_df = (
+        df.group_by(["cluster_id", "confidence_score"])
+        .agg([
+            pl.col("tpn_id").drop_nulls().unique().alias("legal_entity_ids"),
+            pl.col("legal_entity").drop_nulls().unique().alias("legal_entity_names"),
+            (
+                pl.col("tpn_id").drop_nulls().n_unique() +
+                pl.col("local_id").drop_nulls().n_unique()
+            ).alias("cluster_size"),
+            pl.col("dedup_decision").is_null().sum().alias("matching_to_process"),
+            pl.len().alias("total_matching"),
+            pl.col("flux_source").drop_nulls().unique().alias("sources"),
+            pl.col("created_at").max().alias("created_at"),
+            pl.col("updated_at").max().alias("updated_at"),
+        ])
+        .filter(pl.col("total_matching") > 2)
+    )
 
-        try:
-            with conn.cursor() as cur:
-                if params is not None:
-                    cur.execute(query, params)
-                else:
-                    cur.execute(query)
-
-                rows = cur.fetchall()
-                columns = [desc[0] for desc in cur.description] if cur.description else []
-
-            if not columns:
-                return pl.DataFrame()
-
-            if not rows:
-                if schema is not None:
-                    return pl.DataFrame(schema=schema)
-                return pl.DataFrame(schema={col: pl.Null for col in columns})
-
-            normalized_rows = [self._normalize_row(row, len(columns)) for row in rows]
-
-            # Cas 1: schéma explicite
-            if schema is not None:
-                data = {col: [] for col in columns}
-                for row in normalized_rows:
-                    for col, value in zip(columns, row):
-                        data[col].append(value)
-
-                return pl.DataFrame(data, schema=schema, strict=False)
-
-            # Cas 2: pas de schéma -> tentative d'inférence directe
-            try:
-                data = {col: [] for col in columns}
-                for row in normalized_rows:
-                    for col, value in zip(columns, row):
-                        data[col].append(value)
-
-                return pl.DataFrame(data, strict=False)
-
-            # Cas 3: fallback robuste si types mixtes
-            except Exception:
-                safe_data = {}
-                for idx, col in enumerate(columns):
-                    col_values = [row[idx] for row in normalized_rows]
-                    safe_data[col] = self._coerce_mixed_column(col_values)
-
-                return pl.DataFrame(safe_data, strict=False)
-
-        except Exception as e:
-            raise RuntimeError(f"Erreur lors de la lecture SQL vers Polars: {e}") from e
-
-    def _normalize_row(self, row: Any, expected_len: int) -> list[Any]:
-        """
-        Transforme une row SQL en liste de valeurs propres pour Polars.
-        """
-        if row is None:
-            return [None] * expected_len
-
-        values = list(row)
-        if len(values) != expected_len:
-            raise ValueError(
-                f"Row invalide: longueur {len(values)} != nombre de colonnes {expected_len}"
-            )
-
-        return [self._normalize_value(v) for v in values]
-
-    def _normalize_value(self, value: Any) -> Any:
-        """
-        Normalise les types exotiques provenant du driver SQL.
-        """
-        if value is None:
-            return None
-
-        if isinstance(value, Decimal):
-            return float(value)
-
-        if isinstance(value, (datetime, date, time, str, int, float, bool)):
-            return value
-
-        if isinstance(value, bytes):
-            try:
-                return value.decode("utf-8")
-            except Exception:
-                return value.hex()
-
-        if isinstance(value, dict):
-            # On garde une représentation stable au lieu de prendre arbitrairement la 1re valeur
-            return str(value)
-
-        if isinstance(value, (list, tuple, set)):
-            return str(list(value))
-
-        # UUID, enums, objets driver DB, etc.
-        return str(value)
-
-    def _coerce_mixed_column(self, values: list[Any]) -> list[Any]:
-        """
-        Si une colonne contient des types mixtes incompatibles,
-        convertit proprement en chaîne tout en gardant None.
-        """
-        non_null_types = {type(v) for v in values if v is not None}
-
-        if len(non_null_types) <= 1:
-            return values
-
-        # Tolérance int/float/bool -> on peut convertir vers float ou garder tel quel.
-        numeric_types = {int, float, bool}
-        if non_null_types.issubset(numeric_types):
-            return [None if v is None else float(v) for v in values]
-
-        return [None if v is None else str(v) for v in values]
+    return cluster_stats_df
