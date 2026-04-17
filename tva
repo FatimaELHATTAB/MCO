@@ -1,27 +1,31 @@
 Hello,
 
-The work currently being carried out on the tactical solution is aligned with short-term delivery needs, as this solution is already in production and supports existing providers.
+The work currently being carried out on the tactical solution is aligned with short-term delivery needs, as this solution is already in production and supports several providers (CDP, Sustainalytics, MSCI and Bloomberg).
 
-The current scope includes:
+As planned, the developments are currently progressing on the tactical solution, with the following scope:
 
-the integration of a new provider (Ecovadis),
-the internalization of the fuzzy matching logic (replacing the external API that is being phased out).
+* the integration of a new provider (Ecovadis), for which a solution was presented to end users in December,
+* the internalization of the fuzzy matching logic (replacing the external API that is being phased out).
 
-This roadmap has been planned over a three-week period and is progressing as expected. A first version will be available by early next week, allowing us to start non-regression testing shortly after.
+Fuzzy matching currently applies to CDP, Sustainalytics and MSCI and represents approximately 2,300 third parties (~3% of the total matched population).
 
-From a risk and effort perspective:
+The roadmap remains on track over a three-week period, with a first version expected early next week.
 
-fuzzy matching currently represents approximately 2,300 third parties (~3% of the total scope),
-this limited perimeter significantly reduces the risk of unexpected impacts during non-regression testing,
-based on this scope, the testing phase remains controlled and should not lead to timeline overruns.
+Regarding testing, the plan is the following:
 
-In addition, the work performed on the tactical solution directly contributes to the target solution:
+* focus on the fuzzy matching logic, as this is where the main changes are implemented,
+* validate the results on the existing providers using fuzzy (CDP, Sustainalytics, MSCI),
+* include Ecovadis data in the validation scope, in line with what was presented to end users,
+* perform broader non-regression checks across all providers to ensure overall consistency.
 
-the fuzzy matching internalization is a required building block for the target setup,
-non-regression tests executed now will be reused when integrating providers into the target solution, ensuring consistency and saving time in upcoming phases.
+While the main changes are concentrated on fuzzy (with a limited scope of ~3%), the full solution will still be covered to avoid any side effects.
 
-Overall, this approach allows us to secure current deliveries while efficiently preparing the target solution, with a controlled and realistic timeline.
+In addition, this work directly contributes to the target solution:
 
-Please let me know if you would like to discuss this further.
+* fuzzy internalization is a required component for the target setup,
+* the tests executed now will be reused for future provider integrations, ensuring continuity and saving time.
+
+The current plan remains aligned with the initial timeline and scope.
 
 Best regards,
+[Your Name]
