@@ -1,249 +1,27 @@
-# =========================
-# File: domain/task.py
-# =========================
-from dataclasses import dataclass
-from datetime import datetime
-from typing import Any
+Hello,
 
+The work currently being carried out on the tactical solution is aligned with short-term delivery needs, as this solution is already in production and supports existing providers.
 
-@dataclass
-class Task:
-    row_id: int
-    task_type: str
-    payload: dict[str, Any]
-    status: str
-    created_at: datetime
-    updated_at: datetime | None = None
-    completed_at: datetime | None = None
+The current scope includes:
 
-    @property
-    def job_execution_id(self) -> int | None:
-        value = self.payload.get("jobExecutionId")
-        return int(value) if value is not None else None
+the integration of a new provider (Ecovadis),
+the internalization of the fuzzy matching logic (replacing the external API that is being phased out).
 
-    @property
-    def tpn_ids(self) -> list[str]:
-        value = self.payload.get("tpnIds")
-        return value if isinstance(value, list) else []
+This roadmap has been planned over a three-week period and is progressing as expected. A first version will be available by early next week, allowing us to start non-regression testing shortly after.
 
+From a risk and effort perspective:
 
-# =========================
-# File: clients/db_client.py
-# =========================
-from typing import Any
+fuzzy matching currently represents approximately 2,300 third parties (~3% of the total scope),
+this limited perimeter significantly reduces the risk of unexpected impacts during non-regression testing,
+based on this scope, the testing phase remains controlled and should not lead to timeline overruns.
 
+In addition, the work performed on the tactical solution directly contributes to the target solution:
 
-class DBClient:
-    def fetch_one(self, query: str, params: dict[str, Any] | None = None) -> dict[str, Any] | None:
-        raise NotImplementedError
+the fuzzy matching internalization is a required building block for the target setup,
+non-regression tests executed now will be reused when integrating providers into the target solution, ensuring consistency and saving time in upcoming phases.
 
-    def execute(self, query: str, params: dict[str, Any] | None = None) -> None:
-        raise NotImplementedError
+Overall, this approach allows us to secure current deliveries while efficiently preparing the target solution, with a controlled and realistic timeline.
 
+Please let me know if you would like to discuss this further.
 
-# =========================
-# File: repositories/sql_loader.py
-# =========================
-from pathlib import Path
-
-
-class SQLLoader:
-    def __init__(self, sql_dir: str):
-        self.sql_dir = Path(sql_dir)
-
-    def load(self, filename: str) -> str:
-        path = self.sql_dir / filename
-        return path.read_text(encoding="utf-8")
-
-
-# =========================
-# File: repositories/task_repository.py
-# =========================
-from domain.task import Task
-from repositories.sql_loader import SQLLoader
-
-
-class TaskRepository:
-    def __init__(self, db_client, sql_loader: SQLLoader):
-        self.db_client = db_client
-        self.sql_loader = sql_loader
-
-    def claim_next_pending_matching_task(self) -> Task | None:
-        query = self.sql_loader.load("claim_next_pending_matching.sql")
-        row = self.db_client.fetch_one(query)
-
-        if row is None:
-            return None
-
-        return self._to_task(row)
-
-    def mark_done(self, row_id: int) -> None:
-        query = self.sql_loader.load("mark_task_done.sql")
-        self.db_client.execute(query, {"row_id": row_id})
-
-    def mark_failed(self, row_id: int, error_message: str) -> None:
-        query = self.sql_loader.load("mark_task_failed.sql")
-        self.db_client.execute(
-            query,
-            {
-                "row_id": row_id,
-                "error_message": error_message[:1000],
-            },
-        )
-
-    def _to_task(self, row: dict) -> Task:
-        payload = row.get("payload") or {}
-
-        return Task(
-            row_id=row["row_id"],
-            task_type=row["task_type"],
-            payload=payload,
-            status=row["status"],
-            created_at=row["created_at"],
-            updated_at=row.get("updated_at"),
-            completed_at=row.get("completed_at"),
-        )
-
-
-# =========================
-# File: services/task_processor.py
-# =========================
-import logging
-
-from domain.task import Task
-
-logger = logging.getLogger(__name__)
-
-
-class TaskProcessor:
-    def __init__(self, task_repository):
-        self.task_repository = task_repository
-
-    def run_once(self) -> bool:
-        """
-        Récupère une tâche MATCHING en PENDING, la passe en PROCESSING,
-        exécute le traitement, puis la marque DONE ou FAILED.
-        Retourne True si une tâche a été traitée, sinon False.
-        """
-        task = self.task_repository.claim_next_pending_matching_task()
-
-        if task is None:
-            logger.info("Aucune tâche MATCHING en PENDING.")
-            return False
-
-        logger.info("Tâche récupérée: row_id=%s payload=%s", task.row_id, task.payload)
-
-        try:
-            self.process_task(task)
-            self.task_repository.mark_done(task.row_id)
-            logger.info("Tâche %s terminée avec succès.", task.row_id)
-            return True
-
-        except Exception as exc:
-            logger.exception("Erreur sur la tâche %s", task.row_id)
-            self.task_repository.mark_failed(task.row_id, str(exc))
-            return False
-
-    def process_task(self, task: Task) -> None:
-        """
-        Logique métier principale.
-        """
-        job_execution_id = task.job_execution_id
-        if job_execution_id is None:
-            raise ValueError(f"La tâche {task.row_id} ne contient pas de jobExecutionId.")
-
-        self._run_matching_pipeline(job_execution_id)
-
-    def _run_matching_pipeline(self, job_execution_id: int) -> None:
-        """
-        Branche ici ta vraie chaîne de traitements.
-        """
-        logger.info("Lancement du pipeline MATCHING pour jobExecutionId=%s", job_execution_id)
-
-        # Exemple :
-        # self.matching_service.load_data(job_execution_id)
-        # self.matching_service.compute_matching(job_execution_id)
-        # self.matching_service.save_results(job_execution_id)
-
-        pass
-
-
-# =========================
-# File: main.py
-# =========================
-import logging
-
-from clients.db_client import DBClient
-from repositories.sql_loader import SQLLoader
-from repositories.task_repository import TaskRepository
-from services.task_processor import TaskProcessor
-
-
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s %(levelname)s %(name)s - %(message)s",
-)
-
-
-def main() -> None:
-    db_client = DBClient()  # Remplace par ton implémentation réelle
-    sql_loader = SQLLoader(sql_dir="sql")
-    task_repository = TaskRepository(db_client=db_client, sql_loader=sql_loader)
-    processor = TaskProcessor(task_repository=task_repository)
-
-    processor.run_once()
-
-
-if __name__ == "__main__":
-    main()
-
-
-# =========================
-# File: sql/claim_next_pending_matching.sql
-# =========================
-"""
-UPDATE task_queue
-SET status = 'PROCESSING',
-    updated_at = NOW()
-WHERE row_id = (
-    SELECT row_id
-    FROM task_queue
-    WHERE task_type = 'MATCHING'
-      AND status = 'PENDING'
-    ORDER BY created_at ASC
-    FOR UPDATE SKIP LOCKED
-    LIMIT 1
-)
-RETURNING
-    row_id,
-    task_type,
-    payload,
-    status,
-    created_at,
-    updated_at,
-    completed_at;
-"""
-
-
-# =========================
-# File: sql/mark_task_done.sql
-# =========================
-"""
-UPDATE task_queue
-SET status = 'DONE',
-    updated_at = NOW(),
-    completed_at = NOW()
-WHERE row_id = %(row_id)s;
-"""
-
-
-# =========================
-# File: sql/mark_task_failed.sql
-# =========================
-"""
-UPDATE task_queue
-SET status = 'FAILED',
-    updated_at = NOW(),
-    error_message = %(error_message)s
-WHERE row_id = %(row_id)s;
-"""
+Best regards,
