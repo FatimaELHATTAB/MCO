@@ -1,1 +1,21 @@
-..
+| Composant     | État actuel              | Événement                 | Condition                             | Nouvel état              |
+| ------------- | ------------------------ | ------------------------- | ------------------------------------- | ------------------------ |
+| Matching      | `UNDEFINED`              | Réception tiers           | TVA RPMP présente                     | `PROVIDED_BY_RPMP`       |
+| Matching      | `UNDEFINED`              | Réception tiers           | Pas TVA RPMP + match Orbis            | `MATCHING_ORBIS`         |
+| Matching      | `UNDEFINED`              | Réception tiers           | Pas RPMP/Orbis + match Refinitiv      | `MATCHING_REFINITIV`     |
+| Batch Collect | `PROVIDED_BY_RPMP`       | Validation VIES           | TVA valide                            | `CONFIRMED_BY_VIES`      |
+| Batch Collect | `MATCHING_ORBIS`         | Validation VIES           | TVA Orbis valide                      | `CONFIRMED_BY_ORBIS`     |
+| Batch Collect | `MATCHING_REFINITIV`     | Validation VIES           | TVA Refinitiv valide                  | `CONFIRMED_BY_REFINITIV` |
+| Batch Collect | `UNDEFINED`              | Calcul TVA                | SIREN + country valides + VIES valide | `CONFIRMED_BY_VIES`      |
+| Batch Collect | `UNDEFINED`              | Calcul TVA                | VIES not found                        | `NOT_FOUND`              |
+| Batch Collect | `UNDEFINED`              | Calcul TVA                | Calcul impossible                     | `NOT_ELIGIBLE`           |
+| Matching      | `CONFIRMED_BY_ORBIS`     | Mise à jour matching      | Match Orbis perdu + Refinitiv présent | `MATCHING_REFINITIV`     |
+| Matching      | `CONFIRMED_BY_ORBIS`     | Mise à jour matching      | Match Orbis perdu + rien d’autre      | `NOT_FOUND`              |
+| Matching      | `CONFIRMED_BY_REFINITIV` | Mise à jour matching      | Match Orbis trouvé                    | `MATCHING_ORBIS`         |
+| Matching      | `CONFIRMED_BY_REFINITIV` | Mise à jour RPMP          | TVA RPMP ajoutée                      | `PROVIDED_BY_RPMP`       |
+| Batch Collect | `CONFIRMED_BY_VIES`      | Mise à jour SIREN/country | Nouveau calcul VIES valide            | `CONFIRMED_BY_VIES`      |
+| Batch Collect | `CONFIRMED_BY_VIES`      | Mise à jour SIREN/country | Nouveau calcul not found              | `NOT_FOUND`              |
+| Batch Collect | `CONFIRMED_BY_VIES`      | Mise à jour SIREN/country | Nouveau calcul impossible             | `NOT_ELIGIBLE`           |
+| Manuel        | `NOT_FOUND`              | Remédiation ouverte       | Analyse nécessaire                    | `REMEDIATION_ONGOING`    |
+| Manuel        | `REMEDIATION_ONGOING`    | Validation manuelle       | TVA trouvée                           | `CONFIRMED_FOUND_MANUAL` |
+| Manuel        | `REMEDIATION_ONGOING`    | Validation manuelle       | Pas de TVA                            | `CONFIRMED_BLANK_MANUAL` |
