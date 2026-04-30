@@ -30,6 +30,18 @@ sequenceDiagram
     MATCH->>TIR: Read RPMP entity
     MATCH->>EXT: Read external sources
 
+
+
+--------
+
+
+If a Legal Entity has a blank status (e.g. CONFIRMED_BLANK_MANUAL or CONFIRMED_BLANK_REFINITIV),
+
+should other sources be allowed to override it?
+
+In other words:
+Does "blank" mean "nothing exists and cannot be overridden",
+or just "no VAT found for now"? 
     alt VAT provided by RPMP
         MATCH->>LE: status = PROVIDED_BY_RPMP
     else Orbis match found
