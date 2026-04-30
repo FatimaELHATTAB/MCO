@@ -61,3 +61,12 @@ sequenceDiagram
         BTVA->>VIES: Revalide si nécessaire
         BTVA->>LE: Met à jour le statut final
     end
+
+
+If a Legal Entity has a blank status (e.g. CONFIRMED_BLANK_MANUAL or CONFIRMED_BLANK_REFINITIV),
+
+should other sources be allowed to override it?
+
+In other words:
+Does "blank" mean "nothing exists and cannot be overridden",
+or just "no VAT found for now"?
