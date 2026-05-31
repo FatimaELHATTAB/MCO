@@ -24,3 +24,14 @@ SELECT
 FROM pg_stat_user_tables
 WHERE relname LIKE 'provider_data_normalized%'
 ORDER BY pg_total_relation_size(relid) DESC;
+
+
+SELECT pid, now() - query_start AS duration, state, left(query, 100) AS query
+FROM pg_stat_activity
+WHERE state = 'active';
+
+
+INSERT INTO own_91109_svg_um.provider_data_normalized
+SELECT * FROM own_91109_svg_um.provider_data_normalized_old
+WHERE incorporation_country = 'FR'
+ON CONFLICT (local_id, incorporation_country, flux_source) DO NOTHING;
