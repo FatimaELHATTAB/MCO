@@ -35,3 +35,14 @@ INSERT INTO own_91109_svg_um.provider_data_normalized
 SELECT * FROM own_91109_svg_um.provider_data_normalized_old
 WHERE incorporation_country = 'FR'
 ON CONFLICT (local_id, incorporation_country, flux_source) DO NOTHING;
+
+
+-- Ça compte vraiment mais prend du temps
+SELECT COUNT(*) FROM own_91109_svg_um.provider_data_normalized_fr;
+
+-- Ou par partition pour être plus rapide
+SELECT 
+    COUNT(*) FROM own_91109_svg_um.provider_data_normalized_fr
+UNION ALL
+SELECT 
+    COUNT(*) FROM own_91109_svg_um.provider_data_normalized_other;
