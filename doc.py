@@ -14,3 +14,13 @@ SELECT
 FROM pg_stat_user_tables
 WHERE relname LIKE 'provider_data_normalized%'
 ORDER BY relname;
+
+
+SELECT 
+    relname,
+    pg_size_pretty(pg_total_relation_size(relid)) AS taille_totale,
+    pg_size_pretty(pg_relation_size(relid)) AS taille_data,
+    pg_size_pretty(pg_indexes_size(relid)) AS taille_index
+FROM pg_stat_user_tables
+WHERE relname LIKE 'provider_data_normalized%'
+ORDER BY pg_total_relation_size(relid) DESC;
