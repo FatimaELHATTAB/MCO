@@ -1,325 +1,42 @@
-1. Sequence Diagram — Technical Flow
-
-This diagram describes how components interact to determine the VAT status of a Legal Entity.
-
-It highlights the responsibilities of each component:
-- Batch Collect loads and updates data sources
-- UM-Matching selects the best available VAT candidate
-- Batch TVA performs validation and computation
-- VIES API confirms or rejects VAT numbers
-- LEGAL_ENTITY stores the final status
-
-This view focuses on system interactions rather than decision logic.
-
-
-
-sequenceDiagram
-    autonumber
-
-    participant BC as Batch Collect
-    participant TIR as RPMP Entity Table
-    participant EXT as External Sources (Orbis / Refinitiv)
-    participant MATCH as UM-Matching
-    participant LE as LEGAL_ENTITY
-    participant BTVA as Batch TVA
-    participant VIES as VIES API
-
-    BC->>TIR: Insert / update RPMP entity
-    BC->>EXT: Insert / update Orbis / Refinitiv data
-
-    MATCH->>TIR: Read RPMP entity
-    MATCH->>EXT: Read external sources
-
-
-
---------
-
-
-If a Legal Entity has a blank status (e.g. CONFIRMED_BLANK_MANUAL or CONFIRMED_BLANK_REFINITIV),
-
-should other sources be allowed to override it?
-
-In other words:
-Does "blank" mean "nothing exists and cannot be overridden",
-or just "no VAT found for now"? 
-    alt VAT provided by RPMP
-        MATCH->>LE: status = PROVIDED_BY_RPMP
-    else Orbis match found
-        MATCH->>LE: status = MATCHING_ORBIS
-    else Refinitiv match found
-        MATCH->>LE: status = MATCHING_REFINITIV
-    else No match
-        MATCH->>LE: status = UNDEFINED
-    end
-
-    BTVA->>LE: Read Legal Entity
-
-    alt status = PROVIDED_BY_RPMP
-        BTVA->>LE: No action (trusted source)
-
-    else VAT can be computed
-        BTVA->>BTVA: Compute VAT
-        BTVA->>VIES: Validate computed VAT
-        alt valid
-            VIES-->>BTVA: OK
-            BTVA->>LE: status = CONFIRMED_BY_VIES
-        else not found
-            VIES-->>BTVA: NOT_FOUND
-            BTVA->>LE: status = NOT_FOUND
-        end
-
-    else VAT cannot be computed
-        alt status = MATCHING_ORBIS
-            BTVA->>VIES: Validate Orbis VAT
-            alt valid
-                VIES-->>BTVA: OK
-                BTVA->>LE: status = CONFIRMED_BY_ORBIS
-            else not found
-                VIES-->>BTVA: NOT_FOUND
-                BTVA->>LE: status = NOT_FOUND
-            end
-
-        else status = MATCHING_REFINITIV
-            BTVA->>VIES: Validate Refinitiv VAT
-            alt valid
-                VIES-->>BTVA: OK
-                BTVA->>LE: status = CONFIRMED_BY_REFINITIV
-            else not found
-                VIES-->>BTVA: NOT_FOUND
-                BTVA->>LE: status = NOT_FOUND
-            end
-
-        else no fallback
-            BTVA->>LE: status = NOT_ELIGIBLE
-        end
-    end
-
-    opt RPMP update
-        BC->>TIR: RPMP data updated
-        MATCH->>LE: Recompute status
-
-        BTVA->>LE: Re-read entity
-
-        alt new RPMP VAT present
-            BTVA->>LE: status = PROVIDED_BY_RPMP (no VIES)
-        else
-            BTVA->>BTVA: Recompute VAT
-            BTVA->>VIES: Validate
-            BTVA->>LE: Update status
-        end
-    end
-
-    opt External sources update
-        BC->>EXT: Orbis / Refinitiv updated
-        MATCH->>LE: Update matching status
-
-        BTVA->>LE: Re-read entity
-
-        alt computable
-            BTVA->>BTVA: Compute VAT
-            BTVA->>VIES: Validate
-            BTVA->>LE: status = CONFIRMED_BY_VIES
-        else fallback
-            BTVA->>VIES: Validate Orbis / Refinitiv
-            BTVA->>LE: status updated
-        end
-    end
-
-
-------------
-2. Flowchart — Decision Logic
-This diagram represents the decision logic used to determine the VAT status.
-
-The system applies a strict priority order:
-1. VAT provided by RMPM (trusted, no VIES validation)
-2. Computed VAT (based on SIREN and country)
-3. Orbis matching
-4. Refinitiv matching
-
-VIES validation is applied only when the VAT does not come from RMPM.
-
-The flow describes how the system selects the best available source and
-produces a final status based on validation results.
-
-
-
-flowchart TD
-
-    A[Tier reçu ou mis à jour]
-
-    A --> B{TVA fournie par RMPM ?}
-    B -->|Oui| C[PROVIDED_BY_RMPM]
-
-    B -->|Non| D{TVA calculable ?}
-
-    D -->|Oui| E[Calcul TVA]
-    E --> F[Validation VIES]
-
-    F -->|OK| G[CONFIRMED_BY_VIES]
-    F -->|NOT_FOUND| H[NOT_FOUND]
-    F -->|VIES_ERROR| X[VIES_ERROR<br/>Traitement à définir]
-
-    D -->|Non| I{Matching Orbis ?}
-
-    I -->|Oui| J[Validation VIES Orbis]
-    J -->|OK| K[CONFIRMED_BY_ORBIS]
-    J -->|NOT_FOUND| H
-    J -->|VIES_ERROR| X
-
-    I -->|Non| L{Matching Refinitiv ?}
-
-    L -->|Oui| M[Validation VIES Refinitiv]
-    M -->|OK| N[CONFIRMED_BY_REFINITIV]
-    M -->|NOT_FOUND| H
-    M -->|VIES_ERROR| X
-
-    L -->|Non| O[NOT_ELIGIBLE]
-
-    C --> END[Fin]
-    G --> END
-    K --> END
-    N --> END
-    H --> END
-    O --> END
-    X --> END
-
-    END -->|Mise à jour des données| A
-
-    --------------------
-3. State Machine — Lifecycle
-This diagram illustrates how the VAT status evolves over time.
-
-Unlike the flowchart, which describes a single decision,
-the state machine captures transitions between states triggered by data changes.
-
-A Legal Entity can move from one status to another when:
-- RMPM data is updated
-- identification data changes (SIREN, country)
-- Orbis or Refinitiv matching appears or disappears
-- VIES returns a different result
-
-The status is not final. It is continuously re-evaluated based on the latest available data.
-
-At each transition, the same priority rule is applied:
-RMPM > Computation > Orbis > Refinitiv.
-
-
-
-stateDiagram-v2
-    [*] --> NO_STATUS: Création du tiers
-
-    NO_STATUS --> PROVIDED_BY_RMPM: TVA fournie par RMPM
-    NO_STATUS --> CONFIRMED_BY_VIES: Calcul TVA + VIES OK
-    NO_STATUS --> CONFIRMED_BY_ORBIS: Calcul impossible + Orbis + VIES OK
-    NO_STATUS --> CONFIRMED_BY_REFINITIV: Calcul impossible + Refinitiv + VIES OK
-    NO_STATUS --> NOT_FOUND: VIES NOT_FOUND
-    NO_STATUS --> NOT_ELIGIBLE: Aucune source exploitable
-    NO_STATUS --> VIES_ERROR: Erreur technique VIES
-
-    PROVIDED_BY_RMPM --> CONFIRMED_BY_VIES: TVA RMPM supprimée + calcul VIES OK
-    PROVIDED_BY_RMPM --> CONFIRMED_BY_ORBIS: TVA RMPM supprimée + calcul impossible + Orbis OK
-    PROVIDED_BY_RMPM --> CONFIRMED_BY_REFINITIV: TVA RMPM supprimée + calcul impossible + Refinitiv OK
-    PROVIDED_BY_RMPM --> NOT_FOUND: TVA RMPM supprimée + VIES NOT_FOUND
-    PROVIDED_BY_RMPM --> NOT_ELIGIBLE: TVA RMPM supprimée + aucune source exploitable
-
-    CONFIRMED_BY_VIES --> PROVIDED_BY_RMPM: TVA RMPM ajoutée
-    CONFIRMED_BY_VIES --> NOT_FOUND: Recalcul + VIES NOT_FOUND
-    CONFIRMED_BY_VIES --> VIES_ERROR: Recalcul + VIES_ERROR
-    CONFIRMED_BY_VIES --> CONFIRMED_BY_ORBIS: Calcul impossible + Orbis OK
-    CONFIRMED_BY_VIES --> CONFIRMED_BY_REFINITIV: Calcul impossible + Refinitiv OK
-    CONFIRMED_BY_VIES --> NOT_ELIGIBLE: Calcul impossible + aucun fallback
-
-    CONFIRMED_BY_ORBIS --> PROVIDED_BY_RMPM: TVA RMPM ajoutée
-    CONFIRMED_BY_ORBIS --> CONFIRMED_BY_VIES: Calcul devient possible + VIES OK
-    CONFIRMED_BY_ORBIS --> VIES_ERROR: Calcul devient possible + VIES_ERROR
-    CONFIRMED_BY_ORBIS --> CONFIRMED_BY_REFINITIV: Orbis perdu + Refinitiv OK
-    CONFIRMED_BY_ORBIS --> NOT_FOUND: Orbis perdu + VIES NOT_FOUND
-    CONFIRMED_BY_ORBIS --> NOT_ELIGIBLE: Orbis perdu + aucun fallback
-
-    CONFIRMED_BY_REFINITIV --> PROVIDED_BY_RMPM: TVA RMPM ajoutée
-    CONFIRMED_BY_REFINITIV --> CONFIRMED_BY_VIES: Calcul devient possible + VIES OK
-    CONFIRMED_BY_REFINITIV --> VIES_ERROR: Calcul devient possible + VIES_ERROR
-    CONFIRMED_BY_REFINITIV --> CONFIRMED_BY_ORBIS: Orbis apparaît + VIES OK
-    CONFIRMED_BY_REFINITIV --> NOT_FOUND: Refinitiv perdu + VIES NOT_FOUND
-    CONFIRMED_BY_REFINITIV --> NOT_ELIGIBLE: Refinitiv perdu + aucun fallback
-
-    NOT_FOUND --> PROVIDED_BY_RMPM: TVA RMPM ajoutée
-    NOT_FOUND --> CONFIRMED_BY_VIES: Calcul TVA + VIES OK
-    NOT_FOUND --> CONFIRMED_BY_ORBIS: Orbis trouvé + VIES OK
-    NOT_FOUND --> CONFIRMED_BY_REFINITIV: Refinitiv trouvé + VIES OK
-    NOT_FOUND --> VIES_ERROR: Retry + VIES_ERROR
-    NOT_FOUND --> NOT_ELIGIBLE: Plus aucune source exploitable
-
-    NOT_ELIGIBLE --> PROVIDED_BY_RMPM: TVA RMPM ajoutée
-    NOT_ELIGIBLE --> CONFIRMED_BY_VIES: Données deviennent calculables + VIES OK
-    NOT_ELIGIBLE --> CONFIRMED_BY_ORBIS: Orbis trouvé + VIES OK
-    NOT_ELIGIBLE --> CONFIRMED_BY_REFINITIV: Refinitiv trouvé + VIES OK
-
-    VIES_ERROR --> CONFIRMED_BY_VIES: Retry calcul + VIES OK
-    VIES_ERROR --> CONFIRMED_BY_ORBIS: Retry / fallback Orbis OK
-    VIES_ERROR --> CONFIRMED_BY_REFINITIV: Retry / fallback Refinitiv OK
-    VIES_ERROR --> NOT_FOUND: Retry + VIES NOT_FOUND
-    VIES_ERROR --> PROVIDED_BY_RMPM: TVA RMPM ajoutée
-
-    ------------------
-
-4. Open Point — VIES_ERROR Handling
-
-VIES can return three types of outcomes:
-- OK: the VAT number is valid
-- NOT_FOUND: the VAT number is invalid or does not exist
-- VIES_ERROR: a technical failure or service unavailability
-
-The VIES_ERROR case introduces ambiguity.
-
-It does not indicate whether the VAT number is valid or not,
-but simply that the system is temporarily unable to determine it.
-
-This creates a gap in the current logic.
-
-Example scenario:
-
-1. A Legal Entity is CONFIRMED_BY_ORBIS
-2. Identification data changes
-3. VAT becomes computable
-4. VIES is called on the computed VAT
-5. VIES returns VIES_ERROR
-
-Question:
-Should the system overwrite a previously confirmed status
-with a technical error?
-
----
-
-### Key Issue
-
-```text
-A VIES_ERROR should not invalidate a previously confirmed and reliable status.
-
-
-flowchart TD
-
-    A[CONFIRMED_BY_ORBIS]
-
-    A --> B[Update données identification]
-    B --> C{TVA calculable ?}
-
-    C -->|Oui| D[Validation VIES sur TVA calculée]
-
-    D -->|OK| E[CONFIRMED_BY_VIES]
-
-    D -->|NOT_FOUND| F{Fallback disponible ?}
-    F -->|Oui: Orbis| G[CONFIRMED_BY_ORBIS]
-    F -->|Non| H[NOT_FOUND]
-
-    D -->|VIES_ERROR| I[VIES_ERROR]
-    I --> J[Conserver contexte précédent<br/>fallback = CONFIRMED_BY_ORBIS]
-
-    J --> K{Retry VIES}
-    K -->|OK| E
-    K -->|NOT_FOUND| G
-    K -->|VIES_ERROR| I
-
-
-
-----------------
+WITH base AS (
+  SELECT local_id, flux_source, company_name, company_name_clean, incorporation_country
+  FROM own_91109_svg_um.provider_data_normalized
+  WHERE flux_execution_id = '151'
+    AND incorporation_country = 'FR'
+),
+identifiers AS (
+  SELECT p.local_id,
+    STRING_AGG(DISTINCT identifier ->> 'company_identifier', '|'
+      ORDER BY identifier ->> 'company_identifier'
+      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'N')) AS national_registry,
+    STRING_AGG(DISTINCT REGEXP_REPLACE(identifier ->> 'company_identifier', '[^0-9]', '', 'g'), '|'
+      ORDER BY REGEXP_REPLACE(identifier ->> 'company_identifier', '[^0-9]', '', 'g')
+      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'N')) AS national_registry_cleaned,
+    STRING_AGG(DISTINCT identifier ->> 'company_identifier', '|'
+      ORDER BY identifier ->> 'company_identifier'
+      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'I')) AS international_registry
+  FROM own_91109_svg_um.provider_data_normalized p
+  LEFT JOIN LATERAL jsonb_array_elements(p.company_identifier_data) AS identifier ON TRUE
+  WHERE p.flux_execution_id = '151'
+    AND p.incorporation_country = 'FR'
+  GROUP BY p.local_id
+),
+taxes AS (
+  SELECT p.local_id,
+    STRING_AGG(DISTINCT tax ->> 'tax_id', '|') AS tax_id
+  FROM own_91109_svg_um.provider_data_normalized p
+  LEFT JOIN LATERAL jsonb_array_elements(p.tax_data) AS tax ON TRUE
+  WHERE p.flux_execution_id = '151'
+    AND p.incorporation_country = 'FR'
+  GROUP BY p.local_id
+  HAVING STRING_AGG(DISTINCT tax ->> 'tax_id', '|') IS NOT NULL
+)
+SELECT DISTINCT ON (b.incorporation_country, t.tax_id)
+  b.local_id, b.flux_source, b.company_name, b.company_name_clean,
+  b.incorporation_country,
+  i.national_registry, i.national_registry_cleaned, i.international_registry,
+  t.tax_id
+FROM base b
+JOIN taxes t ON t.local_id = b.local_id
+LEFT JOIN identifiers i ON i.local_id = b.local_id
+ORDER BY b.incorporation_country, t.tax_id, b.local_id;
