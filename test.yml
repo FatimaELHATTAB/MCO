@@ -7,18 +7,18 @@ WITH base AS (
 identifiers AS (
   SELECT p.local_id,
     STRING_AGG(DISTINCT identifier ->> 'company_identifier', '|'
-      ORDER BY identifier ->> 'company_identifier'
-      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'N')) AS national_registry,
+      ORDER BY identifier ->> 'company_identifier')
+      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'N') AS national_registry,
     STRING_AGG(DISTINCT REGEXP_REPLACE(identifier ->> 'company_identifier', '[^0-9]', '', 'g'), '|'
-      ORDER BY REGEXP_REPLACE(identifier ->> 'company_identifier', '[^0-9]', '', 'g')
-      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'N')) AS national_registry_cleaned,
+      ORDER BY REGEXP_REPLACE(identifier ->> 'company_identifier', '[^0-9]', '', 'g'))
+      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'N') AS national_registry_cleaned,
     STRING_AGG(DISTINCT identifier ->> 'company_identifier', '|'
-      ORDER BY identifier ->> 'company_identifier'
-      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'I')) AS international_registry
+      ORDER BY identifier ->> 'company_identifier')
+      FILTER (WHERE identifier ->> 'company_identifier_nature' = 'I') AS international_registry
   FROM own_91109_svg_um.provider_data_normalized p
   LEFT JOIN LATERAL jsonb_array_elements(p.company_identifier_data) AS identifier ON TRUE
   WHERE p.flux_execution_id = '151'
-    AND p.incorporation_country = 'FR'
+    AND p.incorporation_country = 'ES'
   GROUP BY p.local_id
 ),
 taxes AS (
