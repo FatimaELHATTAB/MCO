@@ -1,361 +1,362 @@
-# ============================================================
-# FICHIER : data_loader.py
-# ============================================================
-# À faire :
-# 1. Supprimer l'appel à explode_df() dans load()
-# 2. Garder explode_df(), mais elle sera appelée plus tard dans le matching
-# ============================================================
+from typing import Iterator
+
+import polars as pl
+
+from matching_workflow import MatchingPipelineLazy
 
 
-def load(
-    self,
-    provider: str,
-    job_execution_id: int,
-    country: str,
-    params_override=None,
-    df_identity=None,
-):
-    spec = _load_provider_spec(self._config_dir, provider)
-
-    params = dict(spec.params_defaults)
-
-    if params_override:
-        params.update(params_override)
-
-    norm_schema = (
-        _yaml_to_polars_schema(spec.normalized_schema_yaml)
-        if spec.normalized_schema_yaml
-        else None
-    )
-
-    ident_schema = (
-        _yaml_to_polars_schema(spec.identity_schema_yaml)
-        if spec.identity_schema_yaml
-        else None
-    )
-
-    with self._dh_connection() as conn:
-        if country is None:
-            query = spec.normalized_query.format(
-                flux_execution_id=job_execution_id,
-                country="IS NULL",
-            )
-        else:
-            query = spec.normalized_query.format(
-                flux_execution_id=job_execution_id,
-                country=f"= '{country}'",
-            )
-
-        df_normalized = _read_query_as_df(
-            conn=conn,
-            query=query,
-            params=params,
-            schema=norm_schema,
-            chunk_size=spec.chunk_size,
-        )
-
-        if df_identity is None:
-            df_identity = _read_query_as_df(
-                conn=conn,
-                query=spec.identity_query,
-                params=params,
-                schema=ident_schema,
-                chunk_size=spec.chunk_size,
-            )
-
-    # IMPORTANT :
-    # Ne plus faire ça ici :
-    #
-    # if provider == "ORBIS":
-    #     df_normalized = self.explode_df(df_normalized)
-    #     df_identity = self.explode_df(df_identity)
-    #
-    # L'explode sera fait plus tard, batch par batch, dans le matching.
-
-    return df_normalized, df_identity
-
-
-def explode_df(self, df: pl.LazyFrame) -> pl.LazyFrame:
-    df = df.with_columns(
-        pl.col("national_registry")
-        .str.split("|")
-        .alias("national_registry")
-    ).explode("national_registry")
-
-    df = df.with_columns(
-        pl.col("national_registry_cleaned")
-        .str.split("|")
-        .alias("national_registry_cleaned")
-    ).explode("national_registry_cleaned")
-
-    return df
-
-
-# ============================================================
-# FICHIER : matching_workflow.py
-# ============================================================
-# À faire :
-# 1. Dans la classe MatchingPipelineLazy
-# 2. Remplacer l'ancienne fonction run()
-# 3. Ajouter _run_single_batch()
-# ============================================================
-
-
-class MatchingPipelineLazy:
-
-    def __init__(self, ruleset, left_id: str, right_id: str, run_fuzzy: bool = False):
-        self.ruleset = ruleset
-        self.left_id = left_id
-        self.right_id = right_id
-        self.run_fuzzy = run_fuzzy
-
-    def _init_fuzzy_from_rules(self, rule):
-        return RapidFuzzyMatcher(
-            block_left=rule.block_by_left,
-            block_right=rule.block_by_right,
-            top_k=rule.top_k,
-        )
-
-    def _run_single_batch(
+class ProviderRunner:
+    def __init__(
         self,
-        left_lf: pl.LazyFrame,
-        right_lf: pl.LazyFrame,
-        matched_left: set,
-        matched_right: set,
-    ) -> tuple[pl.DataFrame, pl.LazyFrame]:
+        data_loader,
+        cfg,
+        provider: str,
+        job_execution_id: int,
+        logger,
+    ):
+        self.data_loader = data_loader
+        self.cfg = cfg
+        self.provider = provider
+        self.job_execution_id = job_execution_id
+        self.logger = logger
 
-        matches = []
+    def run_countries(self, provider: str | None = None):
+        """
+        Retourne les pays à traiter.
+        """
 
-        exact_matcher = ExactMatcherLazy(
-            self.left_id,
-            self.right_id,
+        current_provider = provider or self.provider
+
+        if current_provider in ["ORBIS", "REFINITIV"]:
+            return [
+                "MR", "RO", "SE", "AT", "ES", "FI", "LV", "BE", "LT", "MT",
+                "CZ", "HU", "CY", "DK", "EE", "SK", "BG", "GR", "PT", "IE",
+                "DE", "SI", "PL", "LU", "NL", "IT", "FR",
+            ]
+
+        self.logger.info(f"Retrieving countries for provider: {self.provider}")
+        countries = self.data_loader.load_countries(self.job_execution_id)
+
+        return countries
+
+    def _to_lazy(
+        self,
+        df: pl.LazyFrame | pl.DataFrame,
+    ) -> pl.LazyFrame:
+        """
+        Convertit en LazyFrame si besoin.
+        """
+        if isinstance(df, pl.DataFrame):
+            return df.lazy()
+
+        return df
+
+    def _lazy_len(
+        self,
+        lf: pl.LazyFrame | pl.DataFrame,
+    ) -> int:
+        """
+        Calcule le nombre de lignes sans collecter toute la table.
+        """
+        if isinstance(lf, pl.DataFrame):
+            return lf.height
+
+        return lf.select(pl.len()).collect(streaming=True).item()
+
+    def _iter_lazy_batches(
+        self,
+        lf: pl.LazyFrame | pl.DataFrame,
+        batch_size: int,
+    ) -> Iterator[tuple[int, pl.LazyFrame]]:
+        """
+        Découpe un LazyFrame/DataFrame en batchs.
+        Retourne :
+        - offset
+        - batch LazyFrame
+        """
+
+        lf = self._to_lazy(lf)
+        total_rows = self._lazy_len(lf)
+
+        self.logger.info(f"Total rows to batch: {total_rows}")
+
+        for offset in range(0, total_rows, batch_size):
+            yield offset, lf.slice(offset, batch_size)
+
+    def _explode_identity_once(
+        self,
+        df_identity: pl.LazyFrame | pl.DataFrame,
+        identity_already_provided: bool,
+    ) -> pl.LazyFrame:
+        """
+        Explose identity une seule fois.
+
+        Si df_identity est fourni en entrée de run(), on considère qu'il peut déjà
+        avoir été préparé par un pays précédent. Donc on évite de l'exploser deux fois.
+        """
+
+        df_identity = self._to_lazy(df_identity)
+
+        if self.provider != "ORBIS":
+            return df_identity
+
+        if identity_already_provided:
+            self.logger.info(
+                "Identity was provided to run(); skipping identity explode to avoid double explode"
+            )
+            return df_identity
+
+        self.logger.info("Exploding identity once before ORBIS batch matching")
+
+        return self.data_loader.explode_df(df_identity)
+
+    def _explode_orbis_batch(
+        self,
+        df_normalized_batch: pl.LazyFrame | pl.DataFrame,
+    ) -> pl.LazyFrame:
+        """
+        Explose uniquement le batch ORBIS courant.
+        """
+
+        df_normalized_batch = self._to_lazy(df_normalized_batch)
+
+        if self.provider != "ORBIS":
+            return df_normalized_batch
+
+        return self.data_loader.explode_df(df_normalized_batch)
+
+    def _concat_dataframes(
+        self,
+        frames: list[pl.DataFrame],
+    ) -> pl.DataFrame:
+        """
+        Concatène une liste de DataFrames.
+        """
+
+        if not frames:
+            return pl.DataFrame()
+
+        return pl.concat(
+            frames,
+            how="diagonal_relaxed",
         )
 
-        combined_rules = [
-            rule
-            for rule in self.ruleset.rules
-            if rule.kind in ["exact", "fuzzy"]
+    def _deduplicate_matches(
+        self,
+        matches: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """
+        Union + déduplication finale.
+
+        Pourquoi ?
+        Comme on fait ORBIS batch par batch, le même couple peut ressortir plusieurs fois.
+        On garde le meilleur match.
+        """
+
+        if matches.is_empty():
+            return matches
+
+        # D'abord on retire les doublons exacts.
+        matches = matches.unique(maintain_order=True)
+
+        # Si tu as un score, on garde le meilleur.
+        if "confidence_score" in matches.columns:
+            matches = matches.sort(
+                "confidence_score",
+                descending=True,
+            )
+
+        # Doublons métier : même local_id + même tpn_id
+        subset_pair = [
+            col for col in ["local_id", "tpn_id"]
+            if col in matches.columns
         ]
 
-        for rule in combined_rules:
-            lf_left = left_lf.filter(
-                ~pl.col(self.left_id).is_in(matched_left)
+        if len(subset_pair) == 2:
+            matches = matches.unique(
+                subset=subset_pair,
+                keep="first",
+                maintain_order=True,
             )
 
-            lf_right = right_lf.filter(
-                ~pl.col(self.right_id).is_in(matched_right)
+        # Si ton modèle métier impose un seul match par local_id,
+        # on garde le meilleur local_id.
+        if "local_id" in matches.columns:
+            matches = matches.unique(
+                subset=["local_id"],
+                keep="first",
+                maintain_order=True,
             )
 
-            if rule.kind == "exact":
-                print("rule==============", rule.name)
+        return matches
 
-                df_match = exact_matcher.apply_rule(
-                    lf_left,
-                    lf_right,
-                    rule,
-                ).collect()
+    def _remove_matched_from_not_matched(
+        self,
+        not_matched: pl.DataFrame,
+        matches: pl.DataFrame,
+    ) -> pl.DataFrame:
+        """
+        Nettoie le not_matched final.
 
-                print("matches exact==============", df_match.shape)
+        Un local_id peut apparaître comme not_matched dans un batch,
+        puis matcher dans un autre résultat.
+        Donc on retire du not_matched tous les local_id déjà présents dans matches.
+        """
 
-            elif rule.kind == "fuzzy":
-                print("rule==============", rule.name)
+        if not_matched.is_empty():
+            return not_matched
 
-                fuzzy_matcher = self._init_fuzzy_from_rules(rule)
+        if matches.is_empty():
+            return not_matched
 
-                fuzzy_df = fuzzy_matcher.match(
-                    lf_left.collect(),
-                    lf_right.collect(),
-                )
+        if "local_id" not in not_matched.columns:
+            return not_matched
 
-                df_match = fuzzy_df.with_columns(
-                    pl.lit("Fuzzy").alias("level"),
-                    pl.col("country").alias("country"),
-                    pl.lit(rule.name).alias("rule_name"),
-                    pl.lit(rule.confidence_level).alias("confidence_level"),
-                )
+        if "local_id" not in matches.columns:
+            return not_matched
 
-                print("matches fuzzy==============", df_match.shape)
+        matched_ids = matches.select("local_id").unique()
 
-            else:
-                continue
-
-            if not df_match.is_empty():
-                matches.append(df_match)
-
-                matched_left.update(
-                    df_match[self.left_id]
-                    .drop_nulls()
-                    .to_list()
-                )
-
-                matched_right.update(
-                    df_match[self.right_id]
-                    .drop_nulls()
-                    .to_list()
-                )
-
-        if matches:
-            matches_df = pl.concat(
-                matches,
-                how="diagonal_relaxed",
-            )
-        else:
-            matches_df = pl.DataFrame(
-                schema={
-                    self.left_id: pl.Utf8,
-                    self.right_id: pl.Utf8,
-                    "level": pl.Utf8,
-                    "rule_name": pl.Utf8,
-                    "confidence_level": pl.Utf8,
-                }
-            )
-
-        left_unmatched = left_lf.filter(
-            ~pl.col(self.left_id).is_in(matched_left)
+        not_matched = not_matched.join(
+            matched_ids,
+            on="local_id",
+            how="anti",
         )
 
-        return matches_df, left_unmatched
+        return not_matched
 
     def run(
         self,
-        left_lf: pl.LazyFrame,
-        right_lf: pl.LazyFrame,
-        batch_size: int | None = None,
-        left_preprocessor=None,
-        right_preprocessor=None,
-    ) -> tuple[pl.DataFrame, pl.DataFrame]:
+        country: str | None,
+        df_identity: pl.LazyFrame | pl.DataFrame | None = None,
+    ) -> tuple[pl.DataFrame, pl.DataFrame, pl.LazyFrame]:
+        """
+        Lance le matching pour un pays.
 
-        matched_left = set()
-        matched_right = set()
+        Stratégie ORBIS :
+        - identity est chargée/explosée une seule fois
+        - normalized / ORBIS est découpée en batchs
+        - chaque batch ORBIS est explosé puis matché avec identity complète
+        - les matches sont concaténés
+        - déduplication finale
+        """
 
-        all_matches = []
-        all_not_matched = []
-
-        if right_preprocessor is not None:
-            right_lf = right_preprocessor(right_lf)
-
-        if batch_size is None:
-            if left_preprocessor is not None:
-                left_lf = left_preprocessor(left_lf)
-
-            matches_df, left_unmatched = self._run_single_batch(
-                left_lf=left_lf,
-                right_lf=right_lf,
-                matched_left=matched_left,
-                matched_right=matched_right,
-            )
-
-            return matches_df, left_unmatched.collect()
-
-        total_rows = (
-            left_lf
-            .select(pl.len())
-            .collect(streaming=True)
-            .item()
+        self.logger.info(
+            f"Running matching for provider={self.provider} | country={country}"
         )
 
-        for offset in range(0, total_rows, batch_size):
-            print(
-                f"Running matching batch offset={offset}, "
-                f"batch_size={batch_size}"
+        rule_set = self.data_loader.get_matching_config(self.provider)
+
+        identity_already_provided = df_identity is not None
+
+        df_normalized, df_identity = self.data_loader.load(
+            provider=self.provider,
+            job_execution_id=self.job_execution_id,
+            country=country,
+            df_identity=df_identity,
+        )
+
+        df_normalized = self._to_lazy(df_normalized)
+        df_identity = self._to_lazy(df_identity)
+
+        self.logger.info("Data loaded successfully")
+
+        # --------------------------------------------------
+        # 1. Explode identity une seule fois
+        # --------------------------------------------------
+        df_identity = self._explode_identity_once(
+            df_identity=df_identity,
+            identity_already_provided=identity_already_provided,
+        )
+
+        # --------------------------------------------------
+        # 2. Batch uniquement sur normalized / ORBIS
+        # --------------------------------------------------
+        batch_size = 2_000_000
+
+        all_matches: list[pl.DataFrame] = []
+        all_not_matched: list[pl.DataFrame] = []
+
+        for batch_idx, (offset, df_normalized_batch) in enumerate(
+            self._iter_lazy_batches(
+                lf=df_normalized,
+                batch_size=batch_size,
+            ),
+            start=1,
+        ):
+            self.logger.info(
+                f"Starting batch {batch_idx} | offset={offset} | batch_size={batch_size}"
             )
 
-            left_batch = left_lf.slice(
-                offset,
-                batch_size,
+            # --------------------------------------------------
+            # 3. Explode du batch ORBIS courant
+            # --------------------------------------------------
+            df_normalized_batch = self._explode_orbis_batch(
+                df_normalized_batch
             )
 
-            if left_preprocessor is not None:
-                left_batch = left_preprocessor(left_batch)
-
-            batch_matches, batch_not_matched = self._run_single_batch(
-                left_lf=left_batch,
-                right_lf=right_lf,
-                matched_left=matched_left,
-                matched_right=matched_right,
+            pipeline = MatchingPipelineLazy(
+                rule_set,
+                left_id="local_id",
+                right_id="tpn_id",
+                run_fuzzy=False,
             )
 
-            if not batch_matches.is_empty():
-                all_matches.append(batch_matches)
+            # --------------------------------------------------
+            # 4. Matching batch ORBIS vs identity complète explosée
+            # --------------------------------------------------
+            matches, not_matched = pipeline.run(
+                df_normalized_batch,
+                df_identity,
+            )
 
-            batch_not_matched_df = batch_not_matched.collect()
-
-            if not batch_not_matched_df.is_empty():
-                all_not_matched.append(batch_not_matched_df)
-
-        if all_matches:
-            matches_df = (
-                pl.concat(
-                    all_matches,
-                    how="diagonal_relaxed",
+            if not matches.is_empty():
+                matches = matches.with_columns(
+                    pl.lit(batch_idx).alias("batch_id"),
+                    pl.lit(offset).alias("batch_offset"),
                 )
-                .unique()
-            )
-        else:
-            matches_df = pl.DataFrame()
 
-        if all_not_matched:
-            not_matched_df = (
-                pl.concat(
-                    all_not_matched,
-                    how="diagonal_relaxed",
+                all_matches.append(matches)
+
+            if not not_matched.is_empty():
+                not_matched = not_matched.with_columns(
+                    pl.lit(batch_idx).alias("batch_id"),
+                    pl.lit(offset).alias("batch_offset"),
                 )
-                .unique()
+
+                all_not_matched.append(not_matched)
+
+            self.logger.info(
+                f"Batch {batch_idx} done | "
+                f"matches={matches.shape} | "
+                f"not_matched={not_matched.shape}"
             )
-        else:
-            not_matched_df = pl.DataFrame()
 
-        return matches_df, not_matched_df
+        # --------------------------------------------------
+        # 5. Union des résultats
+        # --------------------------------------------------
+        matches = self._concat_dataframes(all_matches)
+        not_matched = self._concat_dataframes(all_not_matched)
 
+        self.logger.info(
+            f"Before final cleanup | matches={matches.shape} | not_matched={not_matched.shape}"
+        )
 
-# ============================================================
-# FICHIER : matching_run.py OU provider_runner.py
-# ============================================================
-# À faire :
-# Modifier l'appel à pipeline.run()
-# ============================================================
+        # --------------------------------------------------
+        # 6. Déduplication finale des matches
+        # --------------------------------------------------
+        matches = self._deduplicate_matches(matches)
 
+        # --------------------------------------------------
+        # 7. Nettoyage du not_matched
+        # --------------------------------------------------
+        not_matched = self._remove_matched_from_not_matched(
+            not_matched=not_matched,
+            matches=matches,
+        )
 
-def run(self, country, df_identity):
-    self.logger.info(
-        f"Running Matching for provider {self.provider} - country: {country}"
-    )
+        self.logger.info(
+            f"Matching done | final matches={matches.shape} | final not_matched={not_matched.shape}"
+        )
 
-    rule_set = self.data_loader.get_matching_config(self.provider)
-    data_cfg = self.cfg
-
-    df_normalized, df_identity = self.data_loader.load(
-        self.provider,
-        self.job_execution_id,
-        country,
-        df_identity=df_identity,
-    )
-
-    self.logger.info(f"df_normalized: {df_normalized.collect().shape}")
-    self.logger.info(f"df_identity: {df_identity.collect().shape}")
-
-    left_preprocessor = None
-    right_preprocessor = None
-
-    if self.provider == "ORBIS":
-        left_preprocessor = self.data_loader.explode_df
-        right_preprocessor = self.data_loader.explode_df
-
-    pipeline = MatchingPipelineLazy(
-        rule_set,
-        left_id="local_id",
-        right_id="tpn_id",
-        run_fuzzy=False,
-    )
-
-    matches, not_matched = pipeline.run(
-        left_lf=df_normalized,
-        right_lf=df_identity,
-        batch_size=2_000_000,
-        left_preprocessor=left_preprocessor,
-        right_preprocessor=right_preprocessor,
-    )
-
-    self.logger.info("Matching Done!")
-
-    return matches, not_matched, df_identity
+        return matches, not_matched, df_identity
