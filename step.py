@@ -1,142 +1,76 @@
-import threading
-import time
-from psycopg2.pool import SimpleConnectionPool
+def _lazy_len(self, lf: pl.LazyFrame) -> int:
+    return lf.select(pl.len()).collect(streaming=True).item()
 
 
-def _start_refresh_loop_if_needed(self) -> None:
-    """
-    Start a background thread that refreshes the DB credentials
-    before the Vault lease expires.
+def _iter_lazy_batches(
+    self,
+    lf: pl.LazyFrame,
+    batch_size: int = 2_000_000,
+):
+    total = self._lazy_len(lf)
 
-    This method is safe to call multiple times.
-    The refresh thread will be started only once.
-    """
-    if self._refresh_thread_started:
-        return
-
-    self._refresh_thread_started = True
-
-    thread = threading.Thread(
-        target=self._refresh_loop,
-        daemon=True,
-        name="vault-db-credentials-refresh",
-    )
-    thread.start()
-
-    log.info("Vault DB credentials refresh thread started")
+    for offset in range(0, total, batch_size):
+        yield lf.slice(offset, batch_size)
 
 
-def _refresh_loop(self) -> None:
-    """
-    Background loop responsible for refreshing DB credentials.
+def _explode_if_needed(
+    self,
+    provider: str,
+    df: pl.LazyFrame,
+) -> pl.LazyFrame:
+    if provider != "ORBIS":
+        return df
 
-    It sleeps for around 80% of the Vault lease duration,
-    then recreates the PostgreSQL pool with fresh credentials.
-    """
-    while True:
-        try:
-            creds = self._db_credentials
-
-            if creds and creds.lease_duration:
-                sleep_seconds = int(creds.lease_duration * 0.80)
-            else:
-                # Fallback if Vault does not return a lease duration
-                sleep_seconds = 24 * 3600
-
-            log.info(
-                "Next Vault DB credentials refresh scheduled in %s seconds",
-                sleep_seconds,
-            )
-
-            time.sleep(sleep_seconds)
-
-            self._recreate_pool_with_new_credentials()
-
-        except Exception as exc:
-            log.exception(
-                "Error while refreshing Vault DB credentials: %s",
-                exc,
-            )
-
-            # Avoid tight infinite loop in case of repeated errors
-            time.sleep(3600)
+    return self.data_loader.explode_df(df)
 
 
-def _recreate_pool_with_new_credentials(self) -> None:
-    """
-    Retrieve fresh DB credentials from Vault and recreate the PostgreSQL pool.
-    """
-    log.info("Refreshing database credentials from Vault")
+-------------
 
-    old_pool = self._pool
+all_matches = []
+all_not_matched = []
 
-    creds = self.vault.get_db_credentials()
-    self._db_credentials = creds
+for df_normalized_batch in self._iter_lazy_batches(df_normalized, batch_size=2_000_000):
 
-    new_pool = SimpleConnectionPool(
-        minconn=self.minconn,
-        maxconn=self.maxconn,
-        host=self.db_conf.host,
-        port=self.db_conf.port,
-        dbname=self.db_conf.name,
-        user=creds.username,
-        password=creds.password,
-        sslmode=self.db_conf.sslmode,
+    df_normalized_batch = self._explode_if_needed(
+        self.provider,
+        df_normalized_batch,
     )
 
-    self._pool = new_pool
-
-    if old_pool:
-        old_pool.closeall()
-
-    log.info(
-        "Database credentials refreshed successfully. New lease duration: %s seconds",
-        creds.lease_duration,
+    df_identity_exploded = self._explode_if_needed(
+        self.provider,
+        df_identity,
     )
 
-
-
-def get_db_credentials(self) -> DbCredentials:
-    """
-    Retrieve dynamic database credentials from Vault.
-
-    Returns:
-        DbCredentials: username, password and Vault lease metadata.
-    """
-
-    token = self.get_client_token()
-
-    payload = self.read_secret(
-        path_or_full_url=self.conf.url,
-        token=token,
+    pipeline = MatchingPipelineLazy(
+        rule_set,
+        left_id="local_id",
+        right_id="tpn_id",
+        run_fuzzy=False,
     )
 
-    # Selon la forme de réponse Vault, les credentials peuvent être
-    # soit dans payload["data"], soit dans payload["data"]["data"].
-    data = payload.get("data", {})
-
-    if "data" in data:
-        secret_data = data["data"]
-    else:
-        secret_data = data
-
-    username = secret_data.get("username")
-    password = secret_data.get("password")
-
-    if not username or not password:
-        raise ValueError("Unable to retrieve database username/password from Vault")
-
-    lease_id = payload.get("lease_id") or data.get("lease_id")
-    lease_duration = payload.get("lease_duration") or data.get("lease_duration")
-    renewable = payload.get("renewable") or data.get("renewable") or False
-
-    if lease_duration is not None:
-        lease_duration = int(lease_duration)
-
-    return DbCredentials(
-        username=username,
-        password=password,
-        lease_id=lease_id,
-        lease_duration=lease_duration,
-        renewable=renewable,
+    matches, not_matched = pipeline.run(
+        df_normalized_batch,
+        df_identity_exploded,
     )
+
+    if not matches.is_empty():
+        all_matches.append(matches)
+
+    if not not_matched.is_empty():
+        all_not_matched.append(not_matched)
+
+
+------------
+
+
+if all_matches:
+    matches = pl.concat(all_matches, how="diagonal_relaxed").unique()
+else:
+    matches = pl.DataFrame()
+
+if all_not_matched:
+    not_matched = pl.concat(all_not_matched, how="diagonal_relaxed").unique()
+else:
+    not_matched = pl.DataFrame()
+
+return matches, not_matched, df_identity
