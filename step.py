@@ -93,3 +93,50 @@ def _recreate_pool_with_new_credentials(self) -> None:
         "Database credentials refreshed successfully. New lease duration: %s seconds",
         creds.lease_duration,
     )
+
+
+
+def get_db_credentials(self) -> DbCredentials:
+    """
+    Retrieve dynamic database credentials from Vault.
+
+    Returns:
+        DbCredentials: username, password and Vault lease metadata.
+    """
+
+    token = self.get_client_token()
+
+    payload = self.read_secret(
+        path_or_full_url=self.conf.url,
+        token=token,
+    )
+
+    # Selon la forme de réponse Vault, les credentials peuvent être
+    # soit dans payload["data"], soit dans payload["data"]["data"].
+    data = payload.get("data", {})
+
+    if "data" in data:
+        secret_data = data["data"]
+    else:
+        secret_data = data
+
+    username = secret_data.get("username")
+    password = secret_data.get("password")
+
+    if not username or not password:
+        raise ValueError("Unable to retrieve database username/password from Vault")
+
+    lease_id = payload.get("lease_id") or data.get("lease_id")
+    lease_duration = payload.get("lease_duration") or data.get("lease_duration")
+    renewable = payload.get("renewable") or data.get("renewable") or False
+
+    if lease_duration is not None:
+        lease_duration = int(lease_duration)
+
+    return DbCredentials(
+        username=username,
+        password=password,
+        lease_id=lease_id,
+        lease_duration=lease_duration,
+        renewable=renewable,
+    )
