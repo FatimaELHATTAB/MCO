@@ -1,85 +1,89 @@
-<mxfile host="app.diagrams.net">
-  <diagram name="TVA State Machine">
-    <mxGraphModel dx="1200" dy="800" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1">
-      <root>
-        <mxCell id="0"/>
-        <mxCell id="1" parent="0"/>
+Bonjour,
 
-        <!-- ENTRY -->
-        <mxCell id="tier" value="TIER RECEIVED" style="rounded=1;fillColor=#dae8fc;" vertex="1" parent="1">
-          <mxGeometry x="20" y="200" width="140" height="60" as="geometry"/>
-        </mxCell>
+Avant mon départ en congés, je vous partage un point d’avancement sur les travaux réalisés autour des pipelines CI et des analyses de sécurité.
 
-        <!-- MATCHING -->
-        <mxCell id="rpmp" value="PROVIDED_BY_RPMP" style="rounded=1;fillColor=#d5e8d4;" vertex="1" parent="1">
-          <mxGeometry x="200" y="80" width="180" height="60" as="geometry"/>
-        </mxCell>
+Nous avons réussi à mettre en place l’exécution des pipelines via Loop, ce qui permet désormais de générer les rapports Sonatype, Sonar et Fortify directement dans le processus CI. Cette mise en place a demandé plusieurs ajustements, notamment pour aligner la configuration des pipelines avec les exigences attendues sur les rapports et les images générées.
 
-        <mxCell id="orbis" value="MATCHING_ORBIS" style="rounded=1;fillColor=#d5e8d4;" vertex="1" parent="1">
-          <mxGeometry x="200" y="200" width="180" height="60" as="geometry"/>
-        </mxCell>
+Ce travail a également permis de corriger le problème identifié sur les labels des images Docker pour la partie ULM moteur. Les images produites sont désormais correctement renseignées, ce qui permet de lever ce point de blocage.
 
-        <mxCell id="refinitiv" value="MATCHING_REFINITIV" style="rounded=1;fillColor=#d5e8d4;" vertex="1" parent="1">
-          <mxGeometry x="200" y="320" width="180" height="60" as="geometry"/>
-        </mxCell>
+Côté analyse sécurité, le rapport Fortify ne remonte aucune anomalie : 0 issue détectée.
 
-        <!-- BATCH -->
-        <mxCell id="calc" value="CALCUL TVA" style="rounded=1;fillColor=#fff2cc;" vertex="1" parent="1">
-          <mxGeometry x="420" y="200" width="140" height="60" as="geometry"/>
-        </mxCell>
+Concernant Sonatype, deux dépendances présentent encore des alertes avec un score supérieur à 8 :
 
-        <mxCell id="vies" value="CALL VIES" style="rounded=1;fillColor=#fff2cc;" vertex="1" parent="1">
-          <mxGeometry x="600" y="200" width="140" height="60" as="geometry"/>
-        </mxCell>
+* APScheduler
+* Pandas
 
-        <!-- RESULTS -->
-        <mxCell id="viesok" value="CONFIRMED_BY_VIES" style="rounded=1;fillColor=#f8cecc;" vertex="1" parent="1">
-          <mxGeometry x="800" y="80" width="200" height="60" as="geometry"/>
-        </mxCell>
+Une analyse détaillée a été réalisée sur ces deux alertes. Elles concernent des fonctionnalités des bibliothèques qui ne sont pas utilisées dans notre implémentation actuelle. Le risque est donc limité dans notre contexte d’usage.
 
-        <mxCell id="orbisok" value="CONFIRMED_BY_ORBIS" style="rounded=1;fillColor=#f8cecc;" vertex="1" parent="1">
-          <mxGeometry x="800" y="200" width="200" height="60" as="geometry"/>
-        </mxCell>
+Des waivers ont été créés pour couvrir ces deux points :
 
-        <mxCell id="refok" value="CONFIRMED_BY_REFINITIV" style="rounded=1;fillColor=#f8cecc;" vertex="1" parent="1">
-          <mxGeometry x="800" y="320" width="200" height="60" as="geometry"/>
-        </mxCell>
+* Waiver APScheduler : [à compléter]
+* Waiver Pandas : [à compléter]
 
-        <mxCell id="notfound" value="NOT_FOUND" style="rounded=1;fillColor=#f8cecc;" vertex="1" parent="1">
-          <mxGeometry x="800" y="440" width="200" height="60" as="geometry"/>
-        </mxCell>
+La dernière image à déployer afin que l’ensemble des contrôles passe correctement est la suivante :
 
-        <mxCell id="noteligible" value="NOT_ELIGIBLE" style="rounded=1;fillColor=#f8cecc;" vertex="1" parent="1">
-          <mxGeometry x="800" y="560" width="200" height="60" as="geometry"/>
-        </mxCell>
+* Image à déployer : [à compléter]
 
-        <!-- EDGES -->
-        <mxCell id="e1" edge="1" parent="1" source="tier" target="rpmp"/>
-        <mxCell id="e2" edge="1" parent="1" source="tier" target="orbis"/>
-        <mxCell id="e3" edge="1" parent="1" source="tier" target="refinitiv"/>
+Liens utiles :
 
-        <mxCell id="e4" edge="1" parent="1" source="rpmp" target="calc"/>
-        <mxCell id="e5" edge="1" parent="1" source="orbis" target="calc"/>
-        <mxCell id="e6" edge="1" parent="1" source="refinitiv" target="calc"/>
+* Pipeline CI : [à compléter]
+* Rapport Sonatype : [à compléter]
+* Rapport Sonar : [à compléter]
+* Rapport Fortify : [à compléter]
 
-        <mxCell id="e7" edge="1" parent="1" source="calc" target="vies"/>
+En synthèse, la génération des rapports via Loop est désormais opérationnelle, le problème des labels d’images a été corrigé, Fortify ne remonte aucune issue, et les alertes Sonatype restantes ont été analysées et couvertes par des waivers.
 
-        <mxCell id="e8" edge="1" parent="1" source="vies" target="viesok"/>
-        <mxCell id="e9" edge="1" parent="1" source="vies" target="orbisok"/>
-        <mxCell id="e10" edge="1" parent="1" source="vies" target="refok"/>
-        <mxCell id="e11" edge="1" parent="1" source="vies" target="notfound"/>
-        <mxCell id="e12" edge="1" parent="1" source="vies" target="noteligible"/>
+Cordialement,
+Tima
 
-        <!-- BACK FLOWS -->
-        <mxCell id="b1" edge="1" parent="1" source="orbisok" target="refinitiv"/>
-        <mxCell id="b2" edge="1" parent="1" source="refok" target="orbis"/>
-        <mxCell id="b3" edge="1" parent="1" source="viesok" target="notfound"/>
-        <mxCell id="b4" edge="1" parent="1" source="notfound" target="orbis"/>
-        <mxCell id="b5" edge="1" parent="1" source="notfound" target="refinitiv"/>
-        <mxCell id="b6" edge="1" parent="1" source="orbisok" target="rpmp"/>
-        <mxCell id="b7" edge="1" parent="1" source="refok" target="rpmp"/>
 
-      </root>
-    </mxGraphModel>
-  </diagram>
-</mxfile>
+
+
+
+----------------------------------------
+
+
+
+  Hi all,
+
+As the QUAL PV preparation is planned for **3 July**, here is a status update on the remaining items required for validation.
+
+We have not been able to perform the non-regression tests as initially expected, as we still do not have ISO production data available in the qualification environment.
+
+Therefore, we are proceeding as follows:
+
+1. **All rules except the fuzzy rule**
+   These checks have already been performed on three providers. The objective is to compare the production code with the QUAL code, using QUAL data, with the expectation of obtaining **100% identical ISO results**.
+   Hajar will now consolidate this analysis on **Bloomberg**, which is the most important provider.
+
+2. **Fuzzy rule**
+   A first analysis has already been carried out. We observed that there is no significant gap compared to the previous results, especially since some corrections have been made.
+   The remaining discrepancies can now be explained either by initial data differences or by the technical optimizations we introduced to improve the program’s performance.
+   Paolo will perform this analysis across all providers and document the explanations for the identified gaps.
+
+3. **Qualification run**
+   So far, runs have been performed on the qualification databases, but from the local environment.
+   Before final validation, Hajar will need to deploy the latest version and perform a full run directly on the QUAL environment.
+
+Once these three points are completed and validated, we should be able to proceed with the QUAL PV preparation as planned.
+
+Best regards,
+Fatima
+
+
+
+     ------------------
+
+
+
+     APScheduler is required by the application to schedule internal background jobs. 
+The dependency is declared in the project runtime dependencies and is used only inside a controlled backend execution context.
+
+The identified vulnerability is currently accepted temporarily because:
+- the application does not expose APScheduler directly to external users;
+- job definitions are controlled by the application code and are not provided by user input;
+- there is no public endpoint allowing arbitrary job creation, modification, or execution;
+- the container runs in a restricted environment with limited network and system permissions.
+
+The dependency version has been reviewed and pinned/managed through uv.lock to ensure reproducible builds. 
+We will continue to monitor the vulnerability and upgrade APScheduler as soon as a fixed compatible version is available.
