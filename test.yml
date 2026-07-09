@@ -1,117 +1,109 @@
-Today, the current process handles update_identification notifications from the task_queue table without replaying the full matching process. It closes the current active row in legal_entity, retrieves the already existing matches from the matching table, and replays only the prioritization process to update the active value in legal_entity.
-
 # Flexible Change-Based Action Triggering
 
 ## 1. Context
 
-Today, we already have processes that react to updates coming from the batch collect.
+Today, some processes are already triggered from the `task_queue`.
 
-For example, when an `update_identification` notification is received, we do not replay the full matching process. We only use the existing matching results and replay the prioritization logic to update the active data in `legal_entity`.
+For example, for `update_identification`, we do not replay the full matching.
+The process uses the existing matching results and replays only the prioritization logic to update `legal_entity`.
 
-Now, we have a new need.
+Now, we need a more flexible mechanism to react to specific data changes.
 
-Some changes in the data should trigger a specific action because they have a business impact.
+The main data is stored around `identity`, with related tables such as:
 
-The first case is linked to the `lifecycle` table and the `bnpp_entity` column.
+* `lifecycle`
+* `address`
+* `tax`
+* `company_identifier`
 
-If `bnpp_entity` changes, and the entity moves from outside the CRDS scope to inside the CRDS scope, we need to trigger a CRDS action.
-
-For this first case, the action is to create a `CRDS_NOTIFICATION` in the `task_queue` table with the related `tpn_id`.
-
-But we do not want to build something only for this CRDS case.
-
-Tomorrow, another change may require another treatment, for example:
-
-```text
-address changed
-→ launch an address treatment
-
-tax information changed
-→ launch a tax treatment
-
-company identifier changed
-→ launch an identifier treatment
-```
-
-So the need is to have something flexible and reusable.
+All these tables are linked through the `tpn_id`, which allows us to retrieve the related `legal_entity`.
 
 ---
 
 ## 2. Need
 
-The need is simple:
+Some data changes can have a business impact and must trigger a specific action.
+
+First use case:
 
 ```text
-When an important value changes,
-the system should be able to detect it,
-check if there is a rule for this change,
-and trigger the right action.
+Table: lifecycle
+Column: bnpp_entity
+
+If bnpp_entity changes
+and the entity was previously outside the CRDS scope
+and is now inside the CRDS scope
+then trigger a CRDS action.
 ```
 
-The action can be different depending on the case.
-
-It can be:
+For this first case, the action is:
 
 ```text
-- create a task in task_queue
-- launch a dedicated process
-- update another table
-- replay prioritization
-- only write an audit/log event
+Insert a CRDS_NOTIFICATION into task_queue with the related tpn_id.
 ```
 
-So the target is not only a notification mechanism.
+But the need is not limited to CRDS.
 
-The target is a generic mechanism able to trigger an action based on a detected data change.
+Tomorrow, other changes may require other actions:
+
+```text
+Address changed
+→ trigger an address process
+
+Tax information changed
+→ trigger a tax process
+
+Company identifier changed
+→ trigger an identifier process
+
+Legal entity data changed
+→ replay prioritization or update another table
+```
+
+So the goal is to avoid hardcoding one specific process per use case.
 
 ---
 
 ## 3. Proposed Solution
 
-The idea is to add a generic layer between the data update and the action to execute.
-
-Instead of hardcoding the logic directly in the code, we define rules.
-
-Each rule says:
+The proposed solution is to introduce a generic mechanism based on this logic:
 
 ```text
-On which table we look
-On which column we look
-Which change is important
-Which action must be triggered
+Data change detected
+→ rule evaluation
+→ configured action triggered
 ```
 
-Example:
+The action can be:
 
 ```text
-If lifecycle.bnpp_entity changes
-and the old value was outside CRDS scope
-and the new value is inside CRDS scope
-then create a CRDS_NOTIFICATION in task_queue.
+- insert a task in task_queue
+- launch a dedicated process
+- update a target table
+- replay prioritization
+- write an audit/log event
 ```
 
-This way, the CRDS case is just the first rule.
-Later, we can add other rules for address, tax, company identifier, or any other business case.
+This means the solution is not only a notification mechanism.
+A notification is only one possible action.
 
 ---
 
-## 4. Proposed Configuration Table
+## 4. Configuration Table
 
-To make this flexible, we can create a configuration table.
+To keep the mechanism flexible, the rules can be stored in a configuration table.
 
-Example table name:
+Proposed table:
 
 ```text
 change_action_rule
 ```
 
-This table will contain the rules to apply when a change is detected.
-
-### Proposed structure
+### Table structure
 
 | Column                | Description                                                 |
 | --------------------- | ----------------------------------------------------------- |
-| `rule_id`             | Technical identifier of the rule                            |
+| `rule_id`             | Technical ID of the rule                                    |
 | `rule_name`           | Functional name of the rule                                 |
 | `source_table`        | Table to monitor, for example `lifecycle`, `address`, `tax` |
 | `source_column`       | Column to monitor, for example `bnpp_entity`                |
@@ -121,10 +113,10 @@ This table will contain the rules to apply when a change is detected.
 | `action_name`         | Name of the action                                          |
 | `target_process`      | Process to call if needed                                   |
 | `target_table`        | Table to update if needed                                   |
-| `is_enabled`          | Allows the rule to be activated or deactivated              |
+| `is_enabled`          | Activate or deactivate the rule                             |
 | `priority`            | Priority if several rules are triggered                     |
-| `created_at`          | Creation date                                               |
-| `updated_at`          | Last update date                                            |
+| `created_at`          | Creation timestamp                                          |
+| `updated_at`          | Last update timestamp                                       |
 
 ---
 
@@ -140,24 +132,24 @@ This table will contain the rules to apply when a change is detected.
 
 ---
 
-## 6. How the Table Will Be Used
+## 6. How It Works
 
-When the batch collect updates data, the system compares the old value and the new value.
+When the batch collect updates data, the process compares the previous value and the new value.
 
 If a change is detected, the process checks the `change_action_rule` table.
 
-The process looks for a rule matching:
+It searches for an enabled rule matching:
 
 ```text
 source_table
 source_column
-old value condition
-new value condition
+old_value_condition
+new_value_condition
 ```
 
-If a matching rule is found and the rule is enabled, the configured action is triggered.
+If the rule condition is satisfied, the configured action is triggered.
 
-For example, for CRDS:
+Example for CRDS:
 
 ```text
 source_table = lifecycle
@@ -168,7 +160,7 @@ action_type = TASK_QUEUE_NOTIFICATION
 action_name = CRDS_NOTIFICATION
 ```
 
-Then the process inserts a task into `task_queue`.
+The process will insert a task in `task_queue`.
 
 Example task:
 
@@ -184,25 +176,19 @@ event_type     = BNPP_ENTITY_ENTERED_CRDS_SCOPE
 created_at     = current timestamp
 ```
 
-The `tpn_id` is very important because it allows the next process to retrieve the related `identity`, `legal_entity`, and all linked tables.
+The `tpn_id` is mandatory because it links the event to the impacted `identity`, `legal_entity`, and related tables.
 
 ---
 
-## 7. Possible Action Types
+## 7. Action Types
 
-The action is not always a notification.
-
-The rule can trigger different types of actions:
-
-| action_type               | Meaning                           |
-| ------------------------- | --------------------------------- |
-| `TASK_QUEUE_NOTIFICATION` | Insert a new task in `task_queue` |
-| `PROCESS_EXECUTION`       | Launch a dedicated process        |
-| `DATA_UPDATE`             | Update a target table             |
-| `PRIORITIZATION_REPLAY`   | Replay prioritization logic       |
-| `AUDIT_ONLY`              | Only write an audit/log event     |
-
-This makes the mechanism reusable.
+| action_type               | Meaning                         |
+| ------------------------- | ------------------------------- |
+| `TASK_QUEUE_NOTIFICATION` | Insert a task into `task_queue` |
+| `PROCESS_EXECUTION`       | Launch a dedicated process      |
+| `DATA_UPDATE`             | Update a target table           |
+| `PRIORITIZATION_REPLAY`   | Replay prioritization logic     |
+| `AUDIT_ONLY`              | Only write an audit/log event   |
 
 ---
 
@@ -351,36 +337,22 @@ sequenceDiagram
 
 ---
 
-## 11. Why This Solution Is Useful
+## 11. Key Points
 
-This solution avoids building a specific technical process for each new business case.
-
-Instead of creating hardcoded logic every time a new field needs to trigger something, we use a common mechanism.
-
-The rule table makes the behavior easier to understand, easier to maintain, and easier to extend.
-
-The CRDS case is the first use case, but the same logic can later be reused for other changes.
-
----
-
-## 12. Summary
-
-The objective is to detect important data changes and trigger the right action.
-
-The first example is:
+This solution allows us to:
 
 ```text
-If lifecycle.bnpp_entity changes
-and the entity enters the CRDS scope
-then create a CRDS_NOTIFICATION in task_queue with the related tpn_id.
+- manage CRDS as the first use case
+- avoid hardcoded logic for each new field
+- add new rules by configuration
+- keep traceability of the detected change
+- trigger different action types depending on the need
 ```
 
-But the target solution is more generic:
+The target logic remains simple:
 
 ```text
-Data change detected
-→ rule evaluation
-→ configured action triggered
+A monitored value changes
+→ a rule is evaluated
+→ the configured action is triggered
 ```
-
-The configured action can be a notification, a process execution, a data update, a prioritization replay, or any other future treatment.
