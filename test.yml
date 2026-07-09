@@ -1,730 +1,386 @@
-# ============================================================
-# data_loader.py
-# À mettre dans ta classe DataLoader
-# ============================================================
-
-from typing import Any
-import polars as pl
-
-
-def load_normalized(
-    self,
-    provider: str,
-    country: str,
-    job_execution_id: int | str | None = None,
-    limit: int | None = None,
-    offset: int | None = None,
-) -> pl.DataFrame:
-    """
-    Fonction commune pour ORBIS / REFINITIV / RMPM.
-
-    Règle :
-    - country est toujours présent
-    - job_execution_id est optionnel
-    - si job_execution_id existe, il est mis en premier dans le WHERE
-    - limit / offset sont optionnels, utilisés surtout pour ORBIS
-    """
-
-    spec = _load_provider_spec(self._config_dir, provider)
-
-    norm_schema = (
-        _yaml_to_polars_schema(spec.normalized.schema_yaml)
-        if spec.normalized.schema_yaml
-        else None
-    )
-
-    params: dict[str, Any] = dict(spec.params_defaults)
-
-    provider_lower = provider.lower()
-
-    # Alias SQL selon le provider
-    # ORBIS et REFINITIV utilisent l'alias p
-    # RMPM utilise l'alias le
-    if provider_lower == "rmpm":
-        alias = "le"
-    else:
-        alias = "p"
-
-    conditions: list[str] = []
-
-    # 1. flux_execution_id en premier s'il existe
-    if job_execution_id is not None:
-        conditions.append(f"{alias}.flux_execution_id = %(flux_execution_id)s")
-        params["flux_execution_id"] = job_execution_id
-
-    # 2. country toujours présent
-    conditions.append(f"{alias}.incorporation_country = %(country)s")
-    params["country"] = country
-
-    where_clause = " AND ".join(conditions)
-
-    # 3. LIMIT / OFFSET optionnel
-    if limit is not None:
-        limit_clause = f"LIMIT {int(limit)} OFFSET {int(offset or 0)}"
-    else:
-        limit_clause = ""
-
-    query = spec.normalized.query.format(
-        where_clause=where_clause,
-        limit_clause=limit_clause,
-    )
-
-    with self._db.connection() as conn:
-        df_normalized = _read_query_as_df(
-            conn=conn,
-            query=query,
-            params=params,
-            schema=norm_schema,
-            chunk_size=spec.chunk_size,
-        )
-
-    return df_normalized
-
-
-# ============================================================
-# provider_runner.py
-# À mettre dans ta classe ProviderRunner
-# ============================================================
-
-import gc
-import polars as pl
-
-
-def run(
-    self,
-    country: str,
-    df_identity: pl.LazyFrame | pl.DataFrame | None = None,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Point d'entrée unique.
-
-    - ORBIS : batch SQL avec LIMIT / OFFSET pour éviter saturation mémoire
-    - autres providers : fonctionnement standard
-    """
-
-    if self.provider.lower() == "orbis":
-        return self._run_orbis_batched(
-            country=country,
-            df_identity=df_identity,
-        )
-
-    return self._run_standard(
-        country=country,
-        df_identity=df_identity,
-    )
-
-
-def _run_standard(
-    self,
-    country: str,
-    df_identity: pl.LazyFrame | pl.DataFrame | None = None,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Ancienne logique pour RMPM / REFINITIV / autres providers.
-    """
-
-    self.logger.info(
-        f"Running matching for provider={self.provider} | country={country}"
-    )
-
-    rule_set = load_rules_for_provider(self.provider)
-
-    identity_already_provided = df_identity is not None
-
-    df_normalized = self.data_loader.load_normalized(
-        provider=self.provider,
-        country=country,
-        job_execution_id=self.job_execution_id,
-    )
-
-    if df_identity is None:
-        df_identity = self.data_loader.load_legal_entity(
-            provider=self.provider,
-        )
-
-    df_normalized = self._to_lazy(df_normalized)
-    df_identity = self._to_lazy(df_identity)
-
-    self.logger.info("Data loaded successfully")
-
-    df_normalized = self._explode_if_needed_once(
-        df_normalized=df_normalized,
-        df_identity=df_identity,
-        identity_already_provided=identity_already_provided,
-    )
-
-    pipeline = MatchingPipelineLazy(
-        rule_set,
-        left_id="local_id",
-        right_id="tpn_id",
-        run_fuzzy=False,
-    )
-
-    matches, not_matched = pipeline.run(
-        df_normalized,
-        df_identity,
-    )
-
-    if matches is None:
-        matches = pl.DataFrame()
-
-    if not_matched is None:
-        not_matched = pl.DataFrame()
-
-    self.logger.info(
-        f"Before final cleanup | matches={matches.shape} | not_matched={not_matched.shape}"
-    )
-
-    matches = self._deduplicate_matches(matches)
-
-    not_matched = self._remove_matched_from_not_matched(
-        not_matched=not_matched,
-        matches=matches,
-    )
-
-    self.logger.info(
-        f"Matching done | final matches={matches.shape} | final not_matched={not_matched.shape}"
-    )
-
-    del df_normalized
-    del df_identity
-    del pipeline
-    gc.collect()
-
-    return matches, not_matched
-
-
-def _run_orbis_batched(
-    self,
-    country: str,
-    df_identity: pl.LazyFrame | pl.DataFrame | None = None,
-) -> tuple[pl.DataFrame, pl.DataFrame]:
-    """
-    Logique spéciale ORBIS.
-
-    Important :
-    - on ne charge pas tout ORBIS en mémoire
-    - on charge ORBIS batch par batch depuis SQL
-    - on ne garde que les matches
-    - on ne garde PAS les not_matched de chaque batch
-    - les not_matched sont calculés à la fin depuis identity
-    """
-
-    self.logger.info(
-        f"Running ORBIS batched matching | country={country}"
-    )
-
-    rule_set = load_rules_for_provider(self.provider)
-
-    if df_identity is None:
-        self.logger.info("Loading identity once for ORBIS")
-        df_identity = self.data_loader.load_legal_entity(
-            provider=self.provider,
-        )
-
-    df_identity = self._to_lazy(df_identity)
-
-    batch_size = 50_000
-    offset = 0
-    batch_idx = 1
-
-    all_matches: list[pl.DataFrame] = []
-
-    while True:
-        self.logger.info(
-            f"Loading ORBIS batch | batch_idx={batch_idx} | offset={offset} | batch_size={batch_size}"
-        )
-
-        df_normalized_batch = self.data_loader.load_normalized(
-            provider=self.provider,
-            country=country,
-            job_execution_id=self.job_execution_id,
-            limit=batch_size,
-            offset=offset,
-        )
-
-        if df_normalized_batch is None or df_normalized_batch.is_empty():
-            self.logger.info(
-                f"No more ORBIS rows | last_offset={offset}"
-            )
-            break
-
-        self.logger.info(
-            f"ORBIS batch loaded | batch_idx={batch_idx} | shape={df_normalized_batch.shape}"
-        )
-
-        df_normalized_batch = self._to_lazy(df_normalized_batch)
-
-        df_normalized_batch = self._explode_if_needed_once(
-            df_normalized=df_normalized_batch,
-            df_identity=df_identity,
-            identity_already_provided=True,
-        )
-
-        pipeline = MatchingPipelineLazy(
-            rule_set,
-            left_id="local_id",
-            right_id="tpn_id",
-            run_fuzzy=False,
-        )
-
-        matches, _ = pipeline.run(
-            df_normalized_batch,
-            df_identity,
-        )
-
-        if matches is not None and not matches.is_empty():
-            matches = matches.with_columns(
-                pl.lit(batch_idx).alias("batch_id"),
-                pl.lit(offset).alias("batch_offset"),
-            )
-
-            all_matches.append(matches)
-
-            self.logger.info(
-                f"ORBIS batch done | batch_idx={batch_idx} | matches={matches.shape}"
-            )
-        else:
-            self.logger.info(
-                f"ORBIS batch done | batch_idx={batch_idx} | no matches"
-            )
-
-        del df_normalized_batch
-        del matches
-        del pipeline
-        gc.collect()
-
-        offset += batch_size
-        batch_idx += 1
-
-    matches = self._concat_dataframes(all_matches)
-
-    self.logger.info(
-        f"ORBIS all batches done | matches before dedup={matches.shape}"
-    )
-
-    matches = self._deduplicate_matches(matches)
-
-    not_matched = self._build_not_matched_from_identity(
-        df_identity=df_identity,
-        matches=matches,
-    )
-
-    self.logger.info(
-        f"ORBIS matching done | final matches={matches.shape} | final not_matched={not_matched.shape}"
-    )
-
-    del df_identity
-    del all_matches
-    gc.collect()
-
-    return matches, not_matched
-
-
-def _to_lazy(
-    self,
-    df: pl.LazyFrame | pl.DataFrame,
-) -> pl.LazyFrame:
-    if isinstance(df, pl.LazyFrame):
-        return df
-
-    if isinstance(df, pl.DataFrame):
-        return df.lazy()
-
-    raise TypeError(
-        f"Expected Polars DataFrame or LazyFrame, got {type(df)}"
-    )
-
-
-def _concat_dataframes(
-    self,
-    dfs: list[pl.DataFrame],
-) -> pl.DataFrame:
-    if not dfs:
-        return pl.DataFrame()
-
-    return pl.concat(
-        dfs,
-        how="vertical_relaxed",
-    )
-
-
-def _deduplicate_matches(
-    self,
-    matches: pl.DataFrame,
-) -> pl.DataFrame:
-    if matches is None or matches.is_empty():
-        return pl.DataFrame()
-
-    dedup_cols = [
-        col
-        for col in ["local_id", "tpn_id", "matching_rule"]
-        if col in matches.columns
-    ]
-
-    if not dedup_cols:
-        return matches.unique()
-
-    return matches.unique(
-        subset=dedup_cols,
-        keep="first",
-    )
-
-
-def _remove_matched_from_not_matched(
-    self,
-    not_matched: pl.DataFrame,
-    matches: pl.DataFrame,
-) -> pl.DataFrame:
-    if not_matched is None or not_matched.is_empty():
-        return pl.DataFrame()
-
-    if matches is None or matches.is_empty():
-        return not_matched
-
-    if "tpn_id" not in not_matched.columns or "tpn_id" not in matches.columns:
-        return not_matched
-
-    matched_tpn_ids = (
-        matches
-        .select("tpn_id")
-        .drop_nulls()
-        .unique()
-    )
-
-    return not_matched.join(
-        matched_tpn_ids,
-        on="tpn_id",
-        how="anti",
-    )
-
-
-def _build_not_matched_from_identity(
-    self,
-    df_identity: pl.LazyFrame | pl.DataFrame,
-    matches: pl.DataFrame,
-) -> pl.DataFrame:
-    """
-    Pour ORBIS :
-    on calcule les not_matched seulement à la fin.
-
-    Surtout ne pas faire all_not_matched.append(not_matched)
-    dans la boucle ORBIS.
-    """
-
-    df_identity = self._to_lazy(df_identity)
-
-    if matches is None or matches.is_empty():
-        self.logger.info("No ORBIS matches found, all identity rows are not_matched")
-        return df_identity.collect()
-
-    if "tpn_id" not in matches.columns:
-        self.logger.warning(
-            "Column tpn_id not found in matches, returning full identity as not_matched"
-        )
-        return df_identity.collect()
-
-    matched_tpn_ids = (
-        matches
-        .select("tpn_id")
-        .drop_nulls()
-        .unique()
-        .lazy()
-    )
-
-    not_matched = (
-        df_identity
-        .join(
-            matched_tpn_ids,
-            on="tpn_id",
-            how="anti",
-        )
-        .collect()
-    )
-
-    return not_matched
-
-
-# ============================================================
-# orbis.yaml
-# ============================================================
-
-"""
-chunk_size: 5000
-
-params_defaults: {}
-
-datasets:
-  normalized:
-    query: |
-      SELECT DISTINCT ON (incorporation_country, tax_id)
-        local_id,
-        flux_source,
-        company_name,
-        company_name_clean,
-        incorporation_country,
-        national_registry,
-        national_registry_cleaned,
-        international_registry,
-        tax_id,
-        isin_equity_id
-      FROM (
-        SELECT
-          p.local_id,
-          p.flux_source,
-          p.company_name,
-          p.company_name_clean,
-          p.incorporation_country,
-
-          STRING_AGG(
-            DISTINCT identifier ->> 'company_identifier',
-            '|'
-            ORDER BY identifier ->> 'company_identifier'
-          )
-          FILTER (
-            WHERE identifier ->> 'company_identifier_nature' = 'N'
-              AND identifier ->> 'company_identifier' NOT IN ('NA01', 'NA02')
-          ) AS national_registry,
-
-          STRING_AGG(
-            DISTINCT REGEXP_REPLACE(identifier ->> 'company_identifier', '[^A-Za-z0-9]', '', 'g'),
-            '|'
-            ORDER BY REGEXP_REPLACE(identifier ->> 'company_identifier', '[^A-Za-z0-9]', '', 'g')
-          )
-          FILTER (
-            WHERE identifier ->> 'company_identifier_nature' = 'N'
-              AND identifier ->> 'company_identifier' NOT IN ('NA01', 'NA02')
-          ) AS national_registry_cleaned,
-
-          STRING_AGG(
-            DISTINCT identifier ->> 'company_identifier',
-            '|'
-            ORDER BY identifier ->> 'company_identifier'
-          )
-          FILTER (
-            WHERE identifier ->> 'company_identifier_nature' = 'I'
-          ) AS international_registry,
-
-          STRING_AGG(
-            DISTINCT tax ->> 'tax_id',
-            '|'
-            ORDER BY tax ->> 'tax_id'
-          ) AS tax_id,
-
-          STRING_AGG(
-            DISTINCT isin_equity ->> 'isin_equity_id',
-            '|'
-            ORDER BY isin_equity ->> 'isin_equity_id'
-          ) AS isin_equity_id
-
-        FROM own_9110_svg_um_provider_data_normalized p
-
-        LEFT JOIN LATERAL jsonb_array_elements(p.company_identifier_data) AS identifier ON TRUE
-        LEFT JOIN LATERAL jsonb_array_elements(p.tax_data) AS tax ON TRUE
-        LEFT JOIN LATERAL jsonb_array_elements(p.isin_equity_data) AS isin_equity ON TRUE
-
-        WHERE {where_clause}
-          AND p.tax_data -> 0 ->> 'tax_id' IS NOT NULL
-          AND p.tax_data -> 0 ->> 'tax_id' != 'NA02'
-
-        GROUP BY
-          p.local_id,
-          p.flux_source,
-          p.company_name,
-          p.company_name_clean,
-          p.incorporation_country
-
-        HAVING STRING_AGG(DISTINCT tax ->> 'tax_id', '|') IS NOT NULL
-      ) t
-
-      ORDER BY incorporation_country, tax_id, local_id
-
-      {limit_clause}
-
-    schema:
-      local_id: Utf8
-      flux_source: Utf8
-      company_name: Utf8
-      company_name_clean: Utf8
-      incorporation_country: Utf8
-      national_registry: Utf8
-      national_registry_cleaned: Utf8
-      international_registry: Utf8
-      tax_id: Utf8
-      isin_equity_id: Utf8
-"""
-
-
-# ============================================================
-# refinitiv.yaml
-# ============================================================
-
-"""
-chunk_size: 5000
-
-params_defaults: {}
-
-datasets:
-  normalized:
-    query: |
-      SELECT DISTINCT ON (incorporation_country, tax_id)
-        local_id,
-        flux_source,
-        company_name,
-        company_name_clean,
-        incorporation_country,
-        national_registry,
-        national_registry_cleaned,
-        international_registry,
-        tax_id,
-        isin_equity_id
-      FROM (
-        SELECT
-          p.local_id,
-          p.flux_source,
-          p.company_name,
-          p.company_name_clean,
-          p.incorporation_country,
-
-          STRING_AGG(
-            DISTINCT identifier ->> 'company_identifier',
-            '|'
-            ORDER BY identifier ->> 'company_identifier'
-          )
-          FILTER (
-            WHERE identifier ->> 'company_identifier_nature' = 'N'
-          ) AS national_registry,
-
-          STRING_AGG(
-            DISTINCT REGEXP_REPLACE(identifier ->> 'company_identifier', '[^A-Za-z0-9]', '', 'g'),
-            '|'
-            ORDER BY REGEXP_REPLACE(identifier ->> 'company_identifier', '[^A-Za-z0-9]', '', 'g')
-          )
-          FILTER (
-            WHERE identifier ->> 'company_identifier_nature' = 'N'
-          ) AS national_registry_cleaned,
-
-          STRING_AGG(
-            DISTINCT identifier ->> 'company_identifier',
-            '|'
-            ORDER BY identifier ->> 'company_identifier'
-          )
-          FILTER (
-            WHERE identifier ->> 'company_identifier_nature' = 'I'
-          ) AS international_registry,
-
-          STRING_AGG(
-            DISTINCT tax ->> 'tax_id',
-            '|'
-            ORDER BY tax ->> 'tax_id'
-          ) AS tax_id,
-
-          STRING_AGG(
-            DISTINCT isin_equity ->> 'isin_equity_id',
-            '|'
-            ORDER BY isin_equity ->> 'isin_equity_id'
-          ) AS isin_equity_id
-
-        FROM own_9110_svg_um_provider_data_normalized p
-
-        LEFT JOIN LATERAL jsonb_array_elements(p.company_identifier_data) AS identifier ON TRUE
-        LEFT JOIN LATERAL jsonb_array_elements(p.tax_data) AS tax ON TRUE
-        LEFT JOIN LATERAL jsonb_array_elements(p.isin_equity_data) AS isin_equity ON TRUE
-
-        WHERE {where_clause}
-
-        GROUP BY
-          p.local_id,
-          p.flux_source,
-          p.company_name,
-          p.company_name_clean,
-          p.incorporation_country
-
-        HAVING STRING_AGG(DISTINCT tax ->> 'tax_id', '|') IS NOT NULL
-      ) t
-
-      ORDER BY incorporation_country, tax_id, local_id
-
-      {limit_clause}
-
-    schema:
-      local_id: Utf8
-      flux_source: Utf8
-      company_name: Utf8
-      company_name_clean: Utf8
-      incorporation_country: Utf8
-      national_registry: Utf8
-      national_registry_cleaned: Utf8
-      international_registry: Utf8
-      tax_id: Utf8
-      isin_equity_id: Utf8
-"""
-
-
-# ============================================================
-# rmpm.yaml
-# ============================================================
-
-"""
-chunk_size: 5000
-
-params_defaults: {}
-
-datasets:
-  normalized:
-    query: |
-      SELECT
-        le.local_id,
-        le.flux_source,
-        le.company_name,
-        le.company_name_clean,
-        le.incorporation_country,
-        le.updated_at,
-
-        STRING_AGG(
-          DISTINCT ci.company_identifier,
-          '|'
-          ORDER BY ci.company_identifier
-        )
-        FILTER (
-          WHERE ci.company_identifier_nature = 'N'
-        ) AS national_registry,
-
-        STRING_AGG(
-          DISTINCT ci.company_identifier,
-          '|'
-          ORDER BY ci.company_identifier
-        )
-        FILTER (
-          WHERE ci.company_identifier_nature = 'I'
-            AND ci.company_identifier_name = 'LEI'
-        ) AS international_registry
-
-      FROM own_9119_svg_um_legal_entity_normalized le
-
-      LEFT JOIN own_9119_svg_um_company_identifier_normalized ci
-        ON ci.local_id = le.local_id
-       AND ci.flux_source = le.flux_source
-
-      WHERE {where_clause}
-
-      GROUP BY
-        le.local_id,
-        le.flux_source,
-        le.company_name,
-        le.company_name_clean,
-        le.incorporation_country,
-        le.updated_at
-
-      {limit_clause}
-
-    schema:
-      local_id: Utf8
-      flux_source: Utf8
-      company_name: Utf8
-      company_name_clean: Utf8
-      incorporation_country: Utf8
-      updated_at: Datetime
-      national_registry: Utf8
-      international_registry: Utf8
-"""
+Today, the current process handles update_identification notifications from the task_queue table without replaying the full matching process. It closes the current active row in legal_entity, retrieves the already existing matches from the matching table, and replays only the prioritization process to update the active value in legal_entity.
+
+# Flexible Change-Based Action Triggering
+
+## 1. Context
+
+Today, we already have processes that react to updates coming from the batch collect.
+
+For example, when an `update_identification` notification is received, we do not replay the full matching process. We only use the existing matching results and replay the prioritization logic to update the active data in `legal_entity`.
+
+Now, we have a new need.
+
+Some changes in the data should trigger a specific action because they have a business impact.
+
+The first case is linked to the `lifecycle` table and the `bnpp_entity` column.
+
+If `bnpp_entity` changes, and the entity moves from outside the CRDS scope to inside the CRDS scope, we need to trigger a CRDS action.
+
+For this first case, the action is to create a `CRDS_NOTIFICATION` in the `task_queue` table with the related `tpn_id`.
+
+But we do not want to build something only for this CRDS case.
+
+Tomorrow, another change may require another treatment, for example:
+
+```text
+address changed
+→ launch an address treatment
+
+tax information changed
+→ launch a tax treatment
+
+company identifier changed
+→ launch an identifier treatment
+```
+
+So the need is to have something flexible and reusable.
+
+---
+
+## 2. Need
+
+The need is simple:
+
+```text
+When an important value changes,
+the system should be able to detect it,
+check if there is a rule for this change,
+and trigger the right action.
+```
+
+The action can be different depending on the case.
+
+It can be:
+
+```text
+- create a task in task_queue
+- launch a dedicated process
+- update another table
+- replay prioritization
+- only write an audit/log event
+```
+
+So the target is not only a notification mechanism.
+
+The target is a generic mechanism able to trigger an action based on a detected data change.
+
+---
+
+## 3. Proposed Solution
+
+The idea is to add a generic layer between the data update and the action to execute.
+
+Instead of hardcoding the logic directly in the code, we define rules.
+
+Each rule says:
+
+```text
+On which table we look
+On which column we look
+Which change is important
+Which action must be triggered
+```
+
+Example:
+
+```text
+If lifecycle.bnpp_entity changes
+and the old value was outside CRDS scope
+and the new value is inside CRDS scope
+then create a CRDS_NOTIFICATION in task_queue.
+```
+
+This way, the CRDS case is just the first rule.
+Later, we can add other rules for address, tax, company identifier, or any other business case.
+
+---
+
+## 4. Proposed Configuration Table
+
+To make this flexible, we can create a configuration table.
+
+Example table name:
+
+```text
+change_action_rule
+```
+
+This table will contain the rules to apply when a change is detected.
+
+### Proposed structure
+
+| Column                | Description                                                 |
+| --------------------- | ----------------------------------------------------------- |
+| `rule_id`             | Technical identifier of the rule                            |
+| `rule_name`           | Functional name of the rule                                 |
+| `source_table`        | Table to monitor, for example `lifecycle`, `address`, `tax` |
+| `source_column`       | Column to monitor, for example `bnpp_entity`                |
+| `old_value_condition` | Condition on the previous value                             |
+| `new_value_condition` | Condition on the new value                                  |
+| `action_type`         | Type of action to trigger                                   |
+| `action_name`         | Name of the action                                          |
+| `target_process`      | Process to call if needed                                   |
+| `target_table`        | Table to update if needed                                   |
+| `is_enabled`          | Allows the rule to be activated or deactivated              |
+| `priority`            | Priority if several rules are triggered                     |
+| `created_at`          | Creation date                                               |
+| `updated_at`          | Last update date                                            |
+
+---
+
+## 5. Example of Rules
+
+| rule_name                 | source_table         | source_column      | condition                                                    | action_type               | action_name                 |
+| ------------------------- | -------------------- | ------------------ | ------------------------------------------------------------ | ------------------------- | --------------------------- |
+| Entity enters CRDS scope  | `lifecycle`          | `bnpp_entity`      | Old value outside CRDS scope and new value inside CRDS scope | `TASK_QUEUE_NOTIFICATION` | `CRDS_NOTIFICATION`         |
+| Address changed           | `address`            | `address_value`    | Any change                                                   | `PROCESS_EXECUTION`       | `ADDRESS_UPDATE_PROCESS`    |
+| Tax changed               | `tax`                | `tax_value`        | Any change                                                   | `PROCESS_EXECUTION`       | `TAX_PROCESSING`            |
+| Identifier changed        | `company_identifier` | `identifier_value` | Any change                                                   | `PROCESS_EXECUTION`       | `IDENTIFIER_RECONCILIATION` |
+| Legal entity data changed | `legal_entity`       | Selected fields    | Any change                                                   | `PRIORITIZATION_REPLAY`   | `UPDATE_IDENTIFICATION`     |
+
+---
+
+## 6. How the Table Will Be Used
+
+When the batch collect updates data, the system compares the old value and the new value.
+
+If a change is detected, the process checks the `change_action_rule` table.
+
+The process looks for a rule matching:
+
+```text
+source_table
+source_column
+old value condition
+new value condition
+```
+
+If a matching rule is found and the rule is enabled, the configured action is triggered.
+
+For example, for CRDS:
+
+```text
+source_table = lifecycle
+source_column = bnpp_entity
+old_value_condition = NOT_IN_CRDS_SCOPE
+new_value_condition = IN_CRDS_SCOPE
+action_type = TASK_QUEUE_NOTIFICATION
+action_name = CRDS_NOTIFICATION
+```
+
+Then the process inserts a task into `task_queue`.
+
+Example task:
+
+```text
+task_name      = CRDS_NOTIFICATION
+status         = PENDING
+tpn_id         = impacted tpn_id
+source_table   = lifecycle
+source_column  = bnpp_entity
+old_value      = previous bnpp_entity value
+new_value      = new bnpp_entity value
+event_type     = BNPP_ENTITY_ENTERED_CRDS_SCOPE
+created_at     = current timestamp
+```
+
+The `tpn_id` is very important because it allows the next process to retrieve the related `identity`, `legal_entity`, and all linked tables.
+
+---
+
+## 7. Possible Action Types
+
+The action is not always a notification.
+
+The rule can trigger different types of actions:
+
+| action_type               | Meaning                           |
+| ------------------------- | --------------------------------- |
+| `TASK_QUEUE_NOTIFICATION` | Insert a new task in `task_queue` |
+| `PROCESS_EXECUTION`       | Launch a dedicated process        |
+| `DATA_UPDATE`             | Update a target table             |
+| `PRIORITIZATION_REPLAY`   | Replay prioritization logic       |
+| `AUDIT_ONLY`              | Only write an audit/log event     |
+
+This makes the mechanism reusable.
+
+---
+
+## 8. High-Level Diagram
+
+```mermaid
+flowchart TD
+
+    BC[PROCESS<br/>Batch Collect]
+    CD[PROCESS<br/>Change Detection]
+    RE[PROCESS<br/>Rule Evaluation]
+    AE[PROCESS<br/>Action Execution]
+
+    ID[(TABLE<br/>identity)]
+    LC[(TABLE<br/>lifecycle)]
+    AD[(TABLE<br/>address)]
+    TX[(TABLE<br/>tax)]
+    CI[(TABLE<br/>company_identifier)]
+
+    CFG[(TABLE<br/>change_action_rule)]
+    TQ[(TABLE<br/>task_queue)]
+
+    CRDS[PROCESS<br/>CRDS Processing]
+    ADDR[PROCESS<br/>Address Process]
+    TAXP[PROCESS<br/>Tax Process]
+    IDENTP[PROCESS<br/>Identifier Process]
+    OTHER[PROCESS<br/>Other Action]
+
+    BC -->|Loads / updates data| ID
+    BC -->|Loads / updates data| LC
+    BC -->|Loads / updates data| AD
+    BC -->|Loads / updates data| TX
+    BC -->|Loads / updates data| CI
+
+    BC -->|Provides old and new values| CD
+
+    CD -->|Detected changes| RE
+    CFG -->|Configured rules| RE
+
+    RE -->|Action to trigger| AE
+
+    AE -->|Insert task if required| TQ
+    AE -->|Launch process if required| CRDS
+    AE -->|Launch process if required| ADDR
+    AE -->|Launch process if required| TAXP
+    AE -->|Launch process if required| IDENTP
+    AE -->|Launch another action| OTHER
+```
+
+---
+
+## 9. Sequence Diagram — Generic Case
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant BC as PROCESS<br/>Batch Collect
+    participant DT as TABLE<br/>Data tables<br/>identity / lifecycle / address / tax / company_identifier
+    participant CD as PROCESS<br/>Change Detection
+    participant CFG as TABLE<br/>change_action_rule
+    participant RE as PROCESS<br/>Rule Evaluation
+    participant AE as PROCESS<br/>Action Execution
+    participant TQ as TABLE<br/>task_queue
+    participant DP as PROCESS<br/>Downstream Process
+
+    BC->>DT: Load / update data
+    BC->>CD: Send previous and new values
+
+    CD->>CD: Compare monitored fields
+
+    alt Relevant change detected
+        CD->>RE: Send change details<br/>tpn_id, table, column, old value, new value
+
+        RE->>CFG: Retrieve matching rule
+        CFG-->>RE: Return configured action
+
+        RE->>RE: Evaluate rule conditions
+
+        alt Rule condition is satisfied
+            RE->>AE: Trigger configured action
+
+            alt Action type = task_queue notification
+                AE->>TQ: Insert task with tpn_id and payload
+                TQ-->>AE: Task created
+            else Action type = direct process execution
+                AE->>DP: Launch dedicated process
+                DP-->>AE: Process executed
+            else Action type = data update
+                AE->>DT: Update impacted data
+                DT-->>AE: Data updated
+            end
+
+        else Rule condition is not satisfied
+            RE-->>CD: No action triggered
+        end
+
+    else No relevant change detected
+        CD-->>BC: No action
+    end
+```
+
+---
+
+## 10. Sequence Diagram — CRDS Example
+
+```mermaid
+sequenceDiagram
+    autonumber
+
+    participant BC as PROCESS<br/>Batch Collect
+    participant LC as TABLE<br/>lifecycle
+    participant CD as PROCESS<br/>Change Detection
+    participant CFG as TABLE<br/>change_action_rule
+    participant RE as PROCESS<br/>Rule Evaluation
+    participant TQ as TABLE<br/>task_queue
+    participant CRDS as PROCESS<br/>CRDS Processing
+
+    BC->>LC: Update lifecycle data
+    BC->>CD: Send old and new lifecycle values
+
+    CD->>CD: Detect change on bnpp_entity
+
+    alt bnpp_entity changed
+        CD->>RE: Send change details<br/>tpn_id, old value, new value
+
+        RE->>CFG: Read CRDS rule
+        CFG-->>RE: Return rule configuration
+
+        RE->>RE: Check old value outside CRDS scope<br/>and new value inside CRDS scope
+
+        alt Entity entered CRDS scope
+            RE->>TQ: Insert CRDS_NOTIFICATION<br/>with tpn_id
+            TQ-->>RE: Notification created
+        else Entity did not enter CRDS scope
+            RE-->>CD: No CRDS action
+        end
+
+    else bnpp_entity did not change
+        CD-->>BC: No action
+    end
+
+    CRDS->>TQ: Read pending CRDS_NOTIFICATION
+    TQ-->>CRDS: Return impacted tpn_id
+```
+
+---
+
+## 11. Why This Solution Is Useful
+
+This solution avoids building a specific technical process for each new business case.
+
+Instead of creating hardcoded logic every time a new field needs to trigger something, we use a common mechanism.
+
+The rule table makes the behavior easier to understand, easier to maintain, and easier to extend.
+
+The CRDS case is the first use case, but the same logic can later be reused for other changes.
+
+---
+
+## 12. Summary
+
+The objective is to detect important data changes and trigger the right action.
+
+The first example is:
+
+```text
+If lifecycle.bnpp_entity changes
+and the entity enters the CRDS scope
+then create a CRDS_NOTIFICATION in task_queue with the related tpn_id.
+```
+
+But the target solution is more generic:
+
+```text
+Data change detected
+→ rule evaluation
+→ configured action triggered
+```
+
+The configured action can be a notification, a process execution, a data update, a prioritization replay, or any other future treatment.
