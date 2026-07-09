@@ -1,48 +1,36 @@
+sequenceDiagram
+    autonumber
 
-INSERT INTO own_91109_svg_um.provider_data_normalized
-SELECT * FROM (
-    SELECT * FROM own_91109_svg_um.provider_data_normalized_old
-    LIMIT 100000
-) sub
-ON CONFLICT (local_id, incorporation_country, flux_source) DO NOTHING;
+    participant BC as PROCESS<br/>Batch Collect
+    participant UI as PROCESS<br/>update_identification
+    participant TQ as TABLE<br/>task_queue
+    participant LE as TABLE<br/>legal_entity
+    participant MT as TABLE<br/>matching
+    participant PR as PROCESS<br/>Prioritization
 
+    BC->>TQ: Insert an update notification
 
+    UI->>TQ: Read notifications to process
+    TQ-->>UI: Return update_identification tasks
 
-SELECT 
-    relname,
-    n_live_tup AS estimation_lignes
-FROM pg_stat_user_tables
-WHERE relname LIKE 'provider_data_normalized%'
-ORDER BY relname;
+    Note over UI: Current process today<br/>No full matching replay<br/>No LEI / LUI / ISIN / fuzzy rules are re-executed
 
+    UI->>LE: Identify impacted legal entities
+    LE-->>UI: Return impacted rows
 
-SELECT 
-    relname,
-    pg_size_pretty(pg_total_relation_size(relid)) AS taille_totale,
-    pg_size_pretty(pg_relation_size(relid)) AS taille_data,
-    pg_size_pretty(pg_indexes_size(relid)) AS taille_index
-FROM pg_stat_user_tables
-WHERE relname LIKE 'provider_data_normalized%'
-ORDER BY pg_total_relation_size(relid) DESC;
+    loop For each impacted legal entity
+        UI->>LE: Read the current active row
+        LE-->>UI: Existing active row
 
+        UI->>LE: Close the current active row
+        Note over LE: Update legal_entity<br/>business_valid_to / data_closed_at
 
-SELECT pid, now() - query_start AS duration, state, left(query, 100) AS query
-FROM pg_stat_activity
-WHERE state = 'active';
+        UI->>MT: Retrieve already existing matches
+        MT-->>UI: Return available values by source
 
+        UI->>PR: Replay prioritization only
+        PR-->>UI: Return selected priority value
 
-INSERT INTO own_91109_svg_um.provider_data_normalized
-SELECT * FROM own_91109_svg_um.provider_data_normalized_old
-WHERE incorporation_country = 'FR'
-ON CONFLICT (local_id, incorporation_country, flux_source) DO NOTHING;
-
-
--- Ça compte vraiment mais prend du temps
-SELECT COUNT(*) FROM own_91109_svg_um.provider_data_normalized_fr;
-
--- Ou par partition pour être plus rapide
-SELECT 
-    COUNT(*) FROM own_91109_svg_um.provider_data_normalized_fr
-UNION ALL
-SELECT 
-    COUNT(*) FROM own_91109_svg_um.provider_data_normalized_other;
+        UI->>LE: Insert / update the new active row
+        Note over LE: legal_entity is also the final updated table
+    end
