@@ -1,1 +1,33 @@
+def replace_tax_rows(
+    self,
+    df: pl.DataFrame,
+    *,
+    created_by: str = "VAT_ENRICHMENT",
+) -> None:
+    if df.is_empty():
+        return
 
+    # 1. Fermer les anciennes lignes actives
+    self.db.execute(
+        self.q["close_tax_rows"],
+        params={
+            "ids": df["id"].to_list(),
+        },
+    )
+
+    # 2. Ouvrir les nouvelles lignes
+    new_rows_df = df.select([
+        "tpn_id",
+        "tax_id",
+        "tax_id_status",
+        "tax_label",
+        "business_validity_from",
+    ])
+
+    self.insert_tax_rows(
+        new_rows_df,
+        created_by=created_by,
+    )
+
+
+    
