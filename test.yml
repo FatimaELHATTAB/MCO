@@ -1,33 +1,47 @@
-def replace_tax_rows(
-    self,
-    df: pl.DataFrame,
-    *,
-    created_by: str = "VAT_ENRICHMENT",
-) -> None:
-    if df.is_empty():
-        return
+BEGIN;
 
-    # 1. Fermer les anciennes lignes actives
-    self.db.execute(
-        self.q["close_tax_rows"],
-        params={
-            "ids": df["id"].to_list(),
-        },
-    )
+-- Restaurer sur les lignes d’origine et les nouvelles lignes.
+UPDATE tax AS cible
+SET flux_execution_id = substring(
+        source.created_by
+        FROM '[|]TVA_OLD_FLUX=([0-9]+)$'
+    )::bigint
+FROM tax AS source
+WHERE cible.tpn_id = source.tpn_id
+  AND cible.flux_execution_id = 0
+  AND source.created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$';
 
-    # 2. Ouvrir les nouvelles lignes
-    new_rows_df = df.select([
-        "tpn_id",
-        "tax_id",
-        "tax_id_status",
-        "tax_label",
-        "business_validity_from",
-    ])
+-- Retirer uniquement le suffixe ajouté.
+UPDATE tax
+SET created_by = regexp_replace(
+    created_by,
+    '[|]TVA_OLD_FLUX=[0-9]+$',
+    ''
+)
+WHERE created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$';
 
-    self.insert_tax_rows(
-        new_rows_df,
-        created_by=created_by,
-    )
+COMMIT;
 
 
-    
+BEGIN;
+
+WITH batch AS (
+    SELECT id
+    FROM tax
+    WHERE tax_id_status = 'VES_error'
+      AND closed_at IS NULL
+      AND created_by IS NOT NULL
+      AND flux_execution_id <> 0
+      AND created_by NOT LIKE '%|TVA_OLD_FLUX=%'
+    ORDER BY id
+    LIMIT 30000
+)
+UPDATE tax AS t
+SET created_by = t.created_by
+                 || '|TVA_OLD_FLUX='
+                 || t.flux_execution_id::text,
+    flux_execution_id = 0
+FROM batch AS b
+WHERE t.id = b.id;
+
+COMMIT;
