@@ -1,47 +1,140 @@
 BEGIN;
 
--- Restaurer sur les lignes d’origine et les nouvelles lignes.
-UPDATE tax AS cible
-SET flux_execution_id = substring(
-        source.created_by
-        FROM '[|]TVA_OLD_FLUX=([0-9]+)$'
-    )::bigint
-FROM tax AS source
-WHERE cible.tpn_id = source.tpn_id
-  AND cible.flux_execution_id = 0
-  AND source.created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$';
+-- Vérifier que le flux 0 est disponible.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT 1 FROM legal_entity WHERE flux_execution_id = 0
+    ) OR EXISTS (
+        SELECT 1 FROM tax WHERE flux_execution_id = 0
+    ) THEN
+        RAISE EXCEPTION
+            'Des lignes portent déjà le flux 0 : reprise interrompue';
+    END IF;
+END $$;
 
--- Retirer uniquement le suffixe ajouté.
-UPDATE tax
-SET created_by = regexp_replace(
-    created_by,
-    '[|]TVA_OLD_FLUX=[0-9]+$',
-    ''
+-- Marquer la tâche d’origine et conserver son flux.
+-- Le statut FAILED_REPROCESSING doit être accepté par votre application.
+UPDATE task_queue
+SET status = 'FAILED_REPROCESSING'
+WHERE id = :id_tache_failed
+  AND flux_execution_id = :flux_initial
+  AND status = 'FAILED';
+
+-- Scope = union des deux tables.
+WITH scope AS (
+    SELECT tpn_id
+    FROM legal_entity
+    WHERE flux_execution_id = :flux_initial
+
+    UNION
+
+    SELECT tpn_id
+    FROM tax
+    WHERE flux_execution_id = :flux_initial
+),
+a_reprendre AS MATERIALIZED (
+    SELECT s.tpn_id
+    FROM scope AS s
+    WHERE NOT EXISTS (
+        SELECT 1
+        FROM tax AS t
+        WHERE t.tpn_id = s.tpn_id
+          AND t.closed_at IS NULL
+          AND t.created_by = 'TVA_BATCH'
+    )
+    AND EXISTS (
+        SELECT 1
+        FROM task_queue
+        WHERE id = :id_tache_failed
+          AND flux_execution_id = :flux_initial
+          AND status = 'FAILED_REPROCESSING'
+    )
+),
+maj_legal_entity AS (
+    UPDATE legal_entity AS le
+    SET flux_execution_id = 0
+    FROM a_reprendre AS r
+    WHERE le.tpn_id = r.tpn_id
+      AND le.flux_execution_id = :flux_initial
+    RETURNING le.tpn_id
+),
+maj_tax AS (
+    UPDATE tax AS t
+    SET flux_execution_id = 0
+    FROM a_reprendre AS r
+    WHERE t.tpn_id = r.tpn_id
+      AND t.flux_execution_id = :flux_initial
+      AND t.closed_at IS NULL
+    RETURNING t.tpn_id
 )
-WHERE created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$';
+SELECT
+    (SELECT COUNT(*) FROM maj_legal_entity) AS lignes_legal_entity,
+    (SELECT COUNT(*) FROM maj_tax) AS lignes_tax;
+
+-- Utiliser ici les colonnes de votre notification TVA habituelle.
+INSERT INTO task_queue (
+    task_type,
+    flux_execution_id,
+    status
+)
+SELECT 'TVA', 0, 'PENDING'
+WHERE EXISTS (
+    SELECT 1
+    FROM task_queue
+    WHERE id = :id_tache_failed
+      AND flux_execution_id = :flux_initial
+      AND status = 'FAILED_REPROCESSING'
+)
+AND (
+    EXISTS (SELECT 1 FROM legal_entity WHERE flux_execution_id = 0)
+    OR EXISTS (SELECT 1 FROM tax WHERE flux_execution_id = 0)
+)
+RETURNING id AS id_notification_reprise;
 
 COMMIT;
 
 
+
 BEGIN;
 
-WITH batch AS (
-    SELECT id
-    FROM tax
-    WHERE tax_id_status = 'VES_error'
-      AND closed_at IS NULL
-      AND created_by IS NOT NULL
-      AND flux_execution_id <> 0
-      AND created_by NOT LIKE '%|TVA_OLD_FLUX=%'
-    ORDER BY id
-    LIMIT 30000
-)
+-- Restaurer le flux depuis la tâche d’origine marquée.
+UPDATE legal_entity AS le
+SET flux_execution_id = q.flux_execution_id
+FROM task_queue AS q
+WHERE q.id = :id_tache_failed
+  AND q.status = 'FAILED_REPROCESSING'
+  AND q.flux_execution_id = :flux_initial
+  AND le.flux_execution_id = 0;
+
+-- Inclut les nouvelles lignes et les lignes fermées par TVA.
 UPDATE tax AS t
-SET created_by = t.created_by
-                 || '|TVA_OLD_FLUX='
-                 || t.flux_execution_id::text,
-    flux_execution_id = 0
-FROM batch AS b
-WHERE t.id = b.id;
+SET flux_execution_id = q.flux_execution_id
+FROM task_queue AS q
+WHERE q.id = :id_tache_failed
+  AND q.status = 'FAILED_REPROCESSING'
+  AND q.flux_execution_id = :flux_initial
+  AND t.flux_execution_id = 0;
+
+-- Supprimer précisément la notification de reprise,
+-- uniquement après disparition du flux 0 dans les deux tables.
+DELETE FROM task_queue AS reprise
+WHERE reprise.id = :id_notification_reprise
+  AND reprise.id <> :id_tache_failed
+  AND reprise.task_type = 'TVA'
+  AND reprise.flux_execution_id = 0
+  AND EXISTS (
+      SELECT 1
+      FROM task_queue
+      WHERE id = :id_tache_failed
+        AND status = 'FAILED_REPROCESSING'
+        AND flux_execution_id = :flux_initial
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM legal_entity WHERE flux_execution_id = 0
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM tax WHERE flux_execution_id = 0
+  );
 
 COMMIT;
