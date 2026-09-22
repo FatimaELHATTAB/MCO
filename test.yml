@@ -1,6 +1,166 @@
-Intégration de l’API d’immatriculation
-Permettre l’attribution d’un TPN ID aux sources qui le nécessitent, notamment OSRRCX. Le périmètre actuel se limite au RMPM, pour lequel cette attribution n’est pas obligatoire.
-Consolidation et validation de la priorisation des sources internes
-Revoir les règles existantes et les tester sur des données multisources : un premier jet a été réalisé, mais n’a pas pu être validé faute de données.
-Gestion des suppressions dans les flux delta
-Implémenter la prise en charge des suppressions pour les sources internes et externes. La mise à jour est déjà implémentée pour les sources internes.
+BEGIN;
+
+DO $$
+DECLARE
+    current_row  tax%ROWTYPE;
+    previous_row tax%ROWTYPE;
+BEGIN
+    -- Finish the previous retry before starting another batch.
+    IF EXISTS (
+        SELECT 1
+        FROM tax
+        WHERE created_by LIKE '%|TVA_OLD_FLUX=%'
+    ) THEN
+        RAISE EXCEPTION 'A previous retry still needs restoration';
+    END IF;
+
+    FOR current_row IN
+        SELECT *
+        FROM tax
+        WHERE tax_id_status = 'VIES_ERROR'
+          AND closed_at IS NULL
+          AND created_by IS NOT NULL
+          AND flux_execution_id > 0
+        ORDER BY id
+        LIMIT 30000
+        FOR UPDATE
+    LOOP
+        -- Find the latest previous closed version.
+        SELECT *
+        INTO previous_row
+        FROM tax
+        WHERE tpn_id = current_row.tpn_id
+          AND closed_at IS NOT NULL
+          AND closed_by IS DISTINCT FROM 'CIB_RETRY'
+          AND (created_at, id)
+              < (current_row.created_at, current_row.id)
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        FOR UPDATE;
+
+        IF FOUND THEN
+            -- Skip if the previous flux cannot be saved.
+            IF previous_row.flux_execution_id IS NULL
+               OR previous_row.flux_execution_id <= 0 THEN
+                CONTINUE;
+            END IF;
+
+            -- Close the current VIES_ERROR row.
+            UPDATE tax
+            SET closed_at = CURRENT_TIMESTAMP,
+                closed_by = 'CIB_RETRY'
+            WHERE id = current_row.id;
+
+            -- Create a new copy of the previous version.
+            -- The historical version remains unchanged.
+            INSERT INTO tax (
+                tpn_id,
+                tax_id,
+                tax_id_status,
+                tax_label,
+                business_validity_from,
+                business_validity_to,
+                created_at,
+                created_by,
+                closed_at,
+                closed_by,
+                flux_execution_id
+            )
+            VALUES (
+                previous_row.tpn_id,
+                previous_row.tax_id,
+                previous_row.tax_id_status,
+                previous_row.tax_label,
+                previous_row.business_validity_from,
+                previous_row.business_validity_to,
+                CURRENT_TIMESTAMP,
+                'CIB_RETRY|TVA_OLD_FLUX='
+                    || previous_row.flux_execution_id::text,
+                NULL,
+                NULL,
+                0
+            );
+
+        ELSE
+            -- No previous version: prepare the existing row.
+            -- Do not close it or create a new row.
+            UPDATE tax
+            SET created_by = created_by
+                             || '|TVA_OLD_FLUX='
+                             || flux_execution_id::text,
+                flux_execution_id = 0
+            WHERE id = current_row.id;
+        END IF;
+    END LOOP;
+END $$;
+
+COMMIT;
+
+
+
+
+
+SELECT
+    id,
+    tpn_id,
+    tax_id_status,
+    created_by,
+    flux_execution_id
+FROM tax
+WHERE closed_at IS NULL
+  AND flux_execution_id = 0
+  AND created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$'
+ORDER BY id;
+
+
+
+BEGIN;
+
+-- Stop if a TPN has multiple different saved flux IDs.
+DO $$
+BEGIN
+    IF EXISTS (
+        SELECT tpn_id
+        FROM tax
+        WHERE created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$'
+        GROUP BY tpn_id
+        HAVING COUNT(
+            DISTINCT substring(
+                created_by FROM '[|]TVA_OLD_FLUX=([0-9]+)$'
+            )::bigint
+        ) > 1
+    ) THEN
+        RAISE EXCEPTION 'Multiple saved flux IDs for the same TPN';
+    END IF;
+END $$;
+
+-- Read saved values from both active and closed rows.
+-- Restore all matching rows at flux 0, including new TVA rows.
+WITH saved_flux AS (
+    SELECT DISTINCT
+        tpn_id,
+        substring(
+            created_by FROM '[|]TVA_OLD_FLUX=([0-9]+)$'
+        )::bigint AS original_flux
+    FROM tax
+    WHERE created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$'
+)
+UPDATE tax AS t
+SET flux_execution_id = s.original_flux
+FROM saved_flux AS s
+WHERE t.tpn_id = s.tpn_id
+  AND t.flux_execution_id = 0;
+
+-- Restore created_by by removing only the temporary suffix.
+UPDATE tax
+SET created_by = regexp_replace(
+    created_by,
+    '[|]TVA_OLD_FLUX=[0-9]+$',
+    ''
+)
+WHERE created_by ~ '[|]TVA_OLD_FLUX=[0-9]+$';
+
+COMMIT;
+
+
+
