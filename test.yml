@@ -1,7 +1,33 @@
+-- ============================================================
+-- 1. CREATE INDEXES ONCE
+-- Run each CREATE INDEX separately, with autocommit enabled.
+-- ============================================================
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tax_retry_previous
+ON tax (tpn_id, created_at DESC, id DESC)
+WHERE closed_at IS NOT NULL
+  AND closed_by IS DISTINCT FROM 'CIB_RETRY';
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tax_retry_batch
+ON tax (id)
+WHERE tax_id_status = 'VIES_ERROR'
+  AND closed_at IS NULL
+  AND created_by IS NOT NULL
+  AND flux_execution_id > 0;
+
+CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_tax_retry_restore
+ON tax (tpn_id)
+WHERE flux_execution_id = 0;
+
+
+-- ============================================================
+-- 2. PREPARE UP TO 30,000 ROWS
+-- ============================================================
+
 BEGIN;
 
 WITH batch AS MATERIALIZED (
-    SELECT *
+    SELECT id, tpn_id, created_at
     FROM tax
     WHERE tax_id_status = 'VIES_ERROR'
       AND closed_at IS NULL
@@ -16,7 +42,14 @@ previous_versions AS MATERIALIZED (
         p.*
     FROM batch AS b
     CROSS JOIN LATERAL (
-        SELECT h.*
+        SELECT
+            h.tpn_id,
+            h.tax_id,
+            h.tax_id_status,
+            h.tax_label,
+            h.business_validity_from,
+            h.business_validity_to,
+            h.flux_execution_id
         FROM tax AS h
         WHERE h.tpn_id = b.tpn_id
           AND h.closed_at IS NOT NULL
@@ -27,7 +60,7 @@ previous_versions AS MATERIALIZED (
     ) AS p
 ),
 closed_rows AS (
-    -- Close current rows that have an eligible previous version.
+    -- Close current rows with an eligible previous version.
     UPDATE tax AS t
     SET closed_at = CURRENT_TIMESTAMP,
         closed_by = 'CIB_RETRY'
@@ -37,7 +70,7 @@ closed_rows AS (
     RETURNING t.id
 ),
 inserted_rows AS (
-    -- Create new active copies; keep historical versions unchanged.
+    -- Create a new active copy; keep history unchanged.
     INSERT INTO tax (
         tpn_id,
         tax_id,
@@ -90,12 +123,20 @@ SELECT
 COMMIT;
 
 
+-- ============================================================
+-- STOP HERE.
+-- Trigger the usual TVA notification for flux_execution_id = 0.
+-- Wait until TVA has fully finished before running section 3.
+-- ============================================================
 
 
+-- ============================================================
+-- 3. RESTORE THE ORIGINAL FLUX AND CLEAN UP
+-- ============================================================
 
 BEGIN;
 
--- Restore the saved flux, including on new TVA rows.
+-- Restore existing rows and new rows created by TVA.
 WITH saved_flux AS MATERIALIZED (
     SELECT DISTINCT
         tpn_id,
